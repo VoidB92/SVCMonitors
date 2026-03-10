@@ -207,6 +207,7 @@ typedef struct {
     unsigned long a0, a1, a2, a3, a4, a5;
     unsigned long pc;
     unsigned long caller;
+    unsigned long clone_fn;
     char desc[DESC_BUF_SIZE];
 } svc_event_t;
 
@@ -1373,6 +1374,7 @@ static void before_generic(hook_fargs4_t *args, void *udata)
     unsigned long a0, a1, a2, a3, a4, a5;
     unsigned long pc = 0;
     unsigned long caller = 0;
+    unsigned long clone_fn = 0;
 
     /* Fast rejection path */
     if (!g_enabled) return;
@@ -1389,6 +1391,11 @@ static void before_generic(hook_fargs4_t *args, void *udata)
     a3 = syscall_argn(args, 3);
     a4 = syscall_argn(args, 4);
     a5 = syscall_argn(args, 5);
+
+    if (nr == __NR_clone && a1) {
+        clone_fn = safe_read_user_ptr(a1);
+        if (!clone_fn) clone_fn = safe_read_user_ptr(a1 + 8);
+    }
 
     if (has_syscall_wrapper) {
         struct pt_regs *r = (struct pt_regs *)((hook_fargs0_t *)args)->args[0];
@@ -1414,6 +1421,7 @@ static void before_generic(hook_fargs4_t *args, void *udata)
         ev->a3 = a3; ev->a4 = a4; ev->a5 = a5;
         ev->pc = pc;
         ev->caller = caller;
+        ev->clone_fn = clone_fn;
 
         /* Copy comm from task_struct */
         {
@@ -1521,6 +1529,18 @@ static hook_entry_t tier2_hooks[] = {
     { 98, 6, 0, 0 },   /* futex */
 };
 #define TIER2_COUNT (sizeof(tier2_hooks) / sizeof(tier2_hooks[0]))
+
+static int is_hooked_nr(int nr)
+{
+    int i;
+    for (i = 0; i < (int)TIER1_COUNT; i++) {
+        if (tier1_hooks[i].nr == nr && tier1_hooks[i].active) return 1;
+    }
+    for (i = 0; i < (int)TIER2_COUNT; i++) {
+        if (tier2_hooks[i].nr == nr && tier2_hooks[i].active) return 1;
+    }
+    return 0;
+}
 
 /* ================================================================
  * Hook installation/removal
@@ -1650,7 +1670,8 @@ static void apply_preset(const char *name)
     }
     if (nrs && cnt > 0) {
         for (i = 0; i < cnt; i++) {
-            bitmap_set(g_nr_bitmap, nrs[i]);
+            if (is_hooked_nr(nrs[i]))
+                bitmap_set(g_nr_bitmap, nrs[i]);
         }
     }
 }
@@ -1795,8 +1816,12 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
     /* ---- enable_nr <n> ---- */
     else if (!strncmp(args, "enable_nr ", 10)) {
         int nr = parse_int(args + 10, 0);
-        bitmap_set(g_nr_bitmap, nr);
-        n = snprintf(buf, blen, "{\"ok\":true,\"enabled_nr\":%d}", nr);
+        if (is_hooked_nr(nr)) {
+            bitmap_set(g_nr_bitmap, nr);
+            n = snprintf(buf, blen, "{\"ok\":true,\"enabled_nr\":%d}", nr);
+        } else {
+            n = snprintf(buf, blen, "{\"ok\":false,\"error\":\"nr_not_hooked\",\"nr\":%d}", nr);
+        }
     }
 
     /* ---- disable_nr <n> ---- */
@@ -1811,6 +1836,7 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
         int i;
         const char *p = args + 8;
         int cnt = 0;
+        int skip = 0;
         for (i = 0; i < BITMAP_LONGS; i++)
             g_nr_bitmap[i] = 0;
         while (*p) {
@@ -1819,14 +1845,18 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
             int consumed = 0;
             int nr = parse_int(p, &consumed);
             if (consumed > 0) {
-                bitmap_set(g_nr_bitmap, nr);
-                cnt++;
+                if (is_hooked_nr(nr)) {
+                    bitmap_set(g_nr_bitmap, nr);
+                    cnt++;
+                } else {
+                    skip++;
+                }
                 p += consumed;
             } else {
                 p++;
             }
         }
-        n = snprintf(buf, blen, "{\"ok\":true,\"set_nrs_count\":%d}", cnt);
+        n = snprintf(buf, blen, "{\"ok\":true,\"set_nrs_count\":%d,\"skipped\":%d}", cnt, skip);
     }
 
     /* ---- enable_all ---- */
@@ -1890,11 +1920,11 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
                 if (i > 0) n += snprintf(buf + n, blen - n, ",");
                 n += snprintf(buf + n, blen - n,
                     "{\"seq\":%u,\"nr\":%d,\"name\":\"%s\",\"pid\":%d,\"uid\":%d,"
-                    "\"comm\":\"%s\",\"pc\":%lu,\"caller\":%lu,"
+                    "\"comm\":\"%s\",\"pc\":%lu,\"caller\":%lu,\"clone_fn\":%lu,"
                     "\"a0\":%lu,\"a1\":%lu,\"a2\":%lu,"
                     "\"a3\":%lu,\"a4\":%lu,\"a5\":%lu,\"desc\":\"%s\"}",
                     ev->seq, ev->nr, get_syscall_name(ev->nr), ev->pid, ev->uid,
-                    ev->comm, ev->pc, ev->caller,
+                    ev->comm, ev->pc, ev->caller, ev->clone_fn,
                     ev->a0, ev->a1, ev->a2,
                     ev->a3, ev->a4, ev->a5, esc);
             }

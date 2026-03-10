@@ -42,6 +42,7 @@ object StatusParser {
         val comm: String,
         val pc: Long = 0,
         val caller: Long = 0,
+        val cloneFn: Long = 0,
         val a0: Long, val a1: Long, val a2: Long,
         val a3: Long, val a4: Long, val a5: Long,
         val desc: String
@@ -131,6 +132,7 @@ object StatusParser {
                         comm = e.optString("comm", ""),
                         pc = e.optLong("pc", 0),
                         caller = e.optLong("caller", 0),
+                        cloneFn = e.optLong("clone_fn", 0),
                         a0 = e.optLong("a0"), a1 = e.optLong("a1"),
                         a2 = e.optLong("a2"), a3 = e.optLong("a3"),
                         a4 = e.optLong("a4"), a5 = e.optLong("a5"),

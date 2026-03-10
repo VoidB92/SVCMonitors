@@ -56,6 +56,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvNrCount: TextView
     private lateinit var tvNrList: TextView
     private val nrNameViews = HashMap<Int, TextView>()
+    private lateinit var filterListContainer: LinearLayout
+    private var hookedNrSet: Set<Int> = emptySet()
 
     /* ── app list data ────────────────────────────────────────── */
     private var appList: List<AppInfo> = emptyList()
@@ -315,6 +317,10 @@ class MainActivity : AppCompatActivity() {
                 setOnClickListener {
                     val nr = etNr.text.toString().toIntOrNull()
                     if (nr != null) {
+                        if (hookedNrSet.isNotEmpty() && !hookedNrSet.contains(nr)) {
+                            tvMsg.text = "提示: NR 未被 hook，可能不会有事件"
+                            return@setOnClickListener
+                        }
                         vm.addNr(nr)
                         etNr.text.clear()
                     }
@@ -337,47 +343,10 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(makeCard {
             addView(makeLabel("按分类选择系统调用"))
-            StatusParser.categories.forEach { cat ->
-                addView(TextView(this@MainActivity).apply {
-                    text = "${cat.icon} ${cat.name}"
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                    setTextColor(cPrimary)
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(0, dp(8), 0, dp(4))
-                })
-
-                cat.syscalls.forEach { sc ->
-                    val row2 = LinearLayout(this@MainActivity).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        setPadding(0, dp(2), 0, dp(2))
-                    }
-                    row2.addView(TextView(this@MainActivity).apply {
-                        text = sc.nr.toString()
-                        typeface = Typeface.MONOSPACE
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                        setTextColor(cSecondary)
-                        minWidth = dp(48)
-                    })
-                    val nameView = TextView(this@MainActivity).apply {
-                        text = "${sc.name}  ${sc.description}"
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                        setTextColor(cText)
-                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                    }
-                    nrNameViews[sc.nr] = nameView
-                    row2.addView(nameView)
-                    row2.addView(Button(this@MainActivity).apply {
-                        text = "+"
-                        setOnClickListener { vm.addNr(sc.nr) }
-                    })
-                    row2.addView(Button(this@MainActivity).apply {
-                        text = "-"
-                        setOnClickListener { vm.removeNr(sc.nr) }
-                    })
-                    addView(row2)
-                }
+            filterListContainer = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
             }
+            addView(filterListContainer)
         })
 
         sv.addView(col)
@@ -560,6 +529,7 @@ class MainActivity : AppCompatActivity() {
                 tvNrList.text = "NR列表: ${s.nrList.joinToString(", ") { "${StatusParser.nrToName(it)}($it)" }}"
                 switchTier2.isChecked = s.tier2
                 refreshNrHighlights(s.nrList)
+                renderFilterList(s.hooks)
             }
         }
 
@@ -683,6 +653,7 @@ class MainActivity : AppCompatActivity() {
         vm.viewModelScope_launch {
             val pcResolved = resolveAddress(evt.pid, evt.pc)
             val callerResolved = resolveAddress(evt.pid, evt.caller)
+            val cloneResolved = if (evt.cloneFn != 0L) resolveAddress(evt.pid, evt.cloneFn) else ""
 
             val fdResolved = if (nrUsesFd(evt.nr)) {
                 val r = KpmBridge.readProcFdLink(evt.pid, evt.a0)
@@ -701,6 +672,9 @@ class MainActivity : AppCompatActivity() {
                 appendLine()
                 appendLine("pc: 0x${java.lang.Long.toHexString(evt.pc)}${if (pcResolved.isNotEmpty()) "  →  $pcResolved" else ""}")
                 appendLine("caller: 0x${java.lang.Long.toHexString(evt.caller)}${if (callerResolved.isNotEmpty()) "  →  $callerResolved" else ""}")
+                if (evt.nr == 220 && evt.cloneFn != 0L) {
+                    appendLine("clone_fn: 0x${java.lang.Long.toHexString(evt.cloneFn)}${if (cloneResolved.isNotEmpty()) "  →  $cloneResolved" else ""}")
+                }
                 if (fdResolved.isNotEmpty()) {
                     appendLine("fd(${evt.a0}): $fdResolved")
                 }
@@ -838,6 +812,108 @@ class MainActivity : AppCompatActivity() {
             } else {
                 tv.setTextColor(cText)
                 tv.typeface = Typeface.DEFAULT
+            }
+        }
+    }
+
+    private fun renderFilterList(hooks: List<StatusParser.HookInfo>) {
+        filterListContainer.removeAllViews()
+        nrNameViews.clear()
+        val hooked = hooks.map { it.nr }.toHashSet()
+        hookedNrSet = hooked
+        if (hooked.isEmpty()) {
+            filterListContainer.addView(TextView(this).apply {
+                text = "暂无已安装的系统调用 Hook"
+                setTextColor(cSecondary)
+                setPadding(0, dp(4), 0, dp(4))
+            })
+            return
+        }
+
+        val used = HashSet<Int>()
+        StatusParser.categories.forEach { cat ->
+            val list = cat.syscalls.filter { hooked.contains(it.nr) }
+            if (list.isEmpty()) return@forEach
+            filterListContainer.addView(TextView(this).apply {
+                text = "${cat.icon} ${cat.name}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(cPrimary)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, dp(8), 0, dp(4))
+            })
+            list.forEach { sc ->
+                used.add(sc.nr)
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(2), 0, dp(2))
+                }
+                row.addView(TextView(this).apply {
+                    text = sc.nr.toString()
+                    typeface = Typeface.MONOSPACE
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTextColor(cSecondary)
+                    minWidth = dp(48)
+                })
+                val nameView = TextView(this).apply {
+                    text = "${sc.name}  ${sc.description}"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    setTextColor(cText)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                nrNameViews[sc.nr] = nameView
+                row.addView(nameView)
+                row.addView(Button(this).apply {
+                    text = "+"
+                    setOnClickListener { vm.addNr(sc.nr) }
+                })
+                row.addView(Button(this).apply {
+                    text = "-"
+                    setOnClickListener { vm.removeNr(sc.nr) }
+                })
+                filterListContainer.addView(row)
+            }
+        }
+
+        val extra = hooks.filter { !used.contains(it.nr) }
+        if (extra.isNotEmpty()) {
+            filterListContainer.addView(TextView(this).apply {
+                text = "＊ 其他"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(cPrimary)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, dp(8), 0, dp(4))
+            })
+            extra.forEach { h ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(2), 0, dp(2))
+                }
+                row.addView(TextView(this).apply {
+                    text = h.nr.toString()
+                    typeface = Typeface.MONOSPACE
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTextColor(cSecondary)
+                    minWidth = dp(48)
+                })
+                val nameView = TextView(this).apply {
+                    text = h.name
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    setTextColor(cText)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                nrNameViews[h.nr] = nameView
+                row.addView(nameView)
+                row.addView(Button(this).apply {
+                    text = "+"
+                    setOnClickListener { vm.addNr(h.nr) }
+                })
+                row.addView(Button(this).apply {
+                    text = "-"
+                    setOnClickListener { vm.removeNr(h.nr) }
+                })
+                filterListContainer.addView(row)
             }
         }
     }

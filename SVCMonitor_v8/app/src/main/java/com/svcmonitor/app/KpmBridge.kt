@@ -98,8 +98,14 @@ object KpmBridge {
                 }
 
                 if (output.isNotEmpty()) {
-                    Log.d(TAG, "execute($command) OK: ${output.take(200)}")
-                    KpmResult(true, output)
+                    val simple = StatusParser.parseSimple(output)
+                    if (simple.ok) {
+                        Log.d(TAG, "execute($command) OK: ${output.take(200)}")
+                        KpmResult(true, output)
+                    } else {
+                        Log.w(TAG, "execute($command) FAIL: ${simple.error}")
+                        KpmResult(false, output, simple.error)
+                    }
                 } else {
                     val errMsg = "exit=$exitCode, no output"
                     Log.w(TAG, "execute($command) FAIL: $errMsg")

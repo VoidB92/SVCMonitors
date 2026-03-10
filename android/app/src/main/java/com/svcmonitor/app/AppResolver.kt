@@ -5,31 +5,28 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 
 /**
- * AppResolver -- resolves installed applications for UID targeting.
- * SVCMonitor v8.3
+ * AppResolver v8.0 — Resolve installed APP list for UID selection.
  */
-object AppResolver {
+data class AppInfo(
+    val label: String,
+    val packageName: String,
+    val uid: Int
+)
 
-    data class AppInfo(
-        val uid: Int,
-        val packageName: String,
-        val label: String
-    ) {
-        override fun toString(): String = "$label ($packageName) [uid=$uid]"
-    }
+object AppResolver {
 
     private var cachedApps: List<AppInfo>? = null
 
-    fun getAllApps(context: Context): List<AppInfo> {
+    fun getAllApps(ctx: Context): List<AppInfo> {
         cachedApps?.let { return it }
 
-        val pm = context.packageManager
+        val pm = ctx.packageManager
         val apps = pm.getInstalledApplications(PackageManager.MATCH_ALL)
             .map { ai ->
                 AppInfo(
-                    uid = ai.uid,
+                    label = ai.loadLabel(pm).toString(),
                     packageName = ai.packageName,
-                    label = pm.getApplicationLabel(ai).toString()
+                    uid = ai.uid
                 )
             }
             .distinctBy { it.uid }
@@ -39,13 +36,12 @@ object AppResolver {
         return apps
     }
 
-    fun searchApps(context: Context, query: String): List<AppInfo> {
-        val q = query.lowercase().trim()
-        if (q.isEmpty()) return getAllApps(context)
-        return getAllApps(context).filter {
-            it.label.lowercase().contains(q) ||
-            it.packageName.lowercase().contains(q) ||
-            it.uid.toString() == q
+    fun getInstalledApps(ctx: Context): List<AppInfo> = getAllApps(ctx)
+
+    fun searchApps(ctx: Context, query: String): List<AppInfo> {
+        val q = query.lowercase()
+        return getAllApps(ctx).filter {
+            it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q)
         }
     }
 

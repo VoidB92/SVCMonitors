@@ -1,243 +1,288 @@
 package com.svcmonitor.app
 
-import org.json.JSONObject
 import org.json.JSONArray
+import org.json.JSONObject
 
 /**
- * StatusParser -- parses JSON responses from the kernel module.
- * SVCMonitor v8.3
+ * StatusParser v8.0 — Parse JSON responses from KPM module.
  */
-
-data class SvcEvent(
-    val seq: Long = 0,
-    val nr: Int = 0,
-    val name: String = "",
-    val pid: Int = 0,
-    val uid: Int = 0,
-    val comm: String = "",
-    val a0: Long = 0, val a1: Long = 0, val a2: Long = 0,
-    val a3: Long = 0, val a4: Long = 0, val a5: Long = 0,
-    val desc: String = "",
-    val caller: String = "",
-    val pc: String = "",
-    val fdPath: String = "",
-    val cloneFn: Long = 0
-)
-
-data class ModuleStatus(
-    val ok: Boolean = false,
-    val enabled: Boolean = false,
-    val uid: Int = -1,
-    val tier2: Boolean = false,
-    val eventsTotal: Long = 0,
-    val eventsBuffered: Int = 0,
-    val nrFilter: String = "",
-    val tier1Hooked: Boolean = false,
-    val tier2Hooked: Boolean = false,
-    val version: String = ""
-)
-
-data class DrainResult(
-    val ok: Boolean = false,
-    val events: List<SvcEvent> = emptyList(),
-    val total: Long = 0,
-    val drained: Int = 0,
-    val buffered: Int = 0
-)
-
-data class SimpleResult(
-    val ok: Boolean = false,
-    val msg: String = "",
-    val error: String = ""
-)
-
-data class Preset(
-    val id: Int,
-    val name: String,
-    val description: String
-) {
-    companion object {
-        val ALL_PRESETS = listOf(
-            Preset(1, "file_io", "File I/O (open/read/write/close)"),
-            Preset(2, "fs_ops", "Filesystem ops (mkdir/unlink/chmod)"),
-            Preset(3, "network", "Network (socket/bind/connect/send)"),
-            Preset(4, "process", "Process mgmt (clone/exec/exit/wait)"),
-            Preset(5, "signal", "Signals (kill/sigaction/sigprocmask)"),
-            Preset(6, "memory", "Memory mgmt (mmap/mprotect/brk)"),
-            Preset(7, "ipc", "IPC (pipe/msg/sem/shm/futex)"),
-            Preset(8, "security", "Security (seccomp/bpf/ptrace/cap)"),
-            Preset(9, "all", "All syscalls (tier1 + tier2)")
-        )
-    }
-}
-
 object StatusParser {
+
+    // ===== Data classes =====
+
+    data class ModuleStatus(
+        val ok: Boolean,
+        val version: String = "",
+        val enabled: Boolean = false,
+        val targetUid: Int = -1,
+        val hooksInstalled: Int = 0,
+        val nrsLogging: Int = 0,
+        val eventsTotal: Int = 0,
+        val eventsBuffered: Int = 0,
+        val tier2: Boolean = false,
+        val loggingNrs: List<Int> = emptyList(),
+        val nrCount: Int = 0,
+        val nrList: List<Int> = emptyList(),
+        val hooks: List<HookInfo> = emptyList(),
+        val error: String = ""
+    )
+
+    data class HookInfo(
+        val nr: Int,
+        val name: String,
+        val method: String
+    )
+
+    data class SvcEvent(
+        val seq: Long = 0,
+        val nr: Int,
+        val name: String,
+        val pid: Int,
+        val uid: Int,
+        val comm: String,
+        val pc: Long = 0,
+        val caller: Long = 0,
+        val cloneFn: Long = 0,
+        val a0: Long, val a1: Long, val a2: Long,
+        val a3: Long, val a4: Long, val a5: Long,
+        val desc: String
+    )
+
+    data class DrainResult(
+        val ok: Boolean,
+        val count: Int = 0,
+        val total: Int = 0,
+        val events: List<SvcEvent> = emptyList(),
+        val error: String = ""
+    )
+
+    data class SimpleResult(
+        val ok: Boolean,
+        val error: String = ""
+    )
+
+    // ===== Parsers =====
 
     fun parseStatus(json: String): ModuleStatus {
         return try {
             val j = JSONObject(json)
+            if (!j.optBoolean("ok", false)) {
+                return ModuleStatus(false, error = j.optString("error", "unknown"))
+            }
+
+            val loggingNrs = mutableListOf<Int>()
+            val nrsArr = j.optJSONArray("logging_nrs")
+            if (nrsArr != null) {
+                for (i in 0 until nrsArr.length()) {
+                    loggingNrs.add(nrsArr.getInt(i))
+                }
+            }
+
+            val hooks = mutableListOf<HookInfo>()
+            val hooksArr = j.optJSONArray("hooks")
+            if (hooksArr != null) {
+                for (i in 0 until hooksArr.length()) {
+                    val h = hooksArr.getJSONObject(i)
+                    hooks.add(HookInfo(
+                        nr = h.optInt("nr"),
+                        name = h.optString("name", ""),
+                        method = h.optString("method", "")
+                    ))
+                }
+            }
+
             ModuleStatus(
-                ok = j.optBoolean("ok", false),
+                ok = true,
+                version = j.optString("version", ""),
                 enabled = j.optBoolean("enabled", false),
-                uid = j.optInt("uid", -1),
+                targetUid = j.optInt("target_uid", -1),
+                hooksInstalled = j.optInt("hooks_installed", 0),
+                nrsLogging = j.optInt("nrs_logging", 0),
+                eventsTotal = j.optInt("events_total", 0),
+                eventsBuffered = j.optInt("events_buffered", 0),
                 tier2 = j.optBoolean("tier2", false),
-                eventsTotal = j.optLong("eventsTotal", 0),
-                eventsBuffered = j.optInt("eventsBuffered", 0),
-                nrFilter = j.optString("nrFilter", ""),
-                tier1Hooked = j.optBoolean("tier1Hooked", false),
-                tier2Hooked = j.optBoolean("tier2Hooked", false),
-                version = j.optString("version", "")
+                loggingNrs = loggingNrs,
+                nrCount = loggingNrs.size,
+                nrList = loggingNrs,
+                hooks = hooks
             )
         } catch (e: Exception) {
-            ModuleStatus()
+            ModuleStatus(false, error = "Parse error: ${e.message}")
         }
     }
 
     fun parseDrain(json: String): DrainResult {
         return try {
             val j = JSONObject(json)
-            val arr = j.optJSONArray("events") ?: JSONArray()
-            val events = (0 until arr.length()).map { parseEvent(arr.getJSONObject(it)) }
+            if (!j.optBoolean("ok", false)) {
+                return DrainResult(false, error = j.optString("error", ""))
+            }
+
+            val events = mutableListOf<SvcEvent>()
+            val arr = j.optJSONArray("events")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val e = arr.getJSONObject(i)
+                    events.add(SvcEvent(
+                        seq = e.optLong("seq", 0),
+                        nr = e.optInt("nr"),
+                        name = e.optString("name", ""),
+                        pid = e.optInt("pid"),
+                        uid = e.optInt("uid"),
+                        comm = e.optString("comm", ""),
+                        pc = e.optLong("pc", 0),
+                        caller = e.optLong("caller", 0),
+                        cloneFn = e.optLong("clone_fn", 0),
+                        a0 = e.optLong("a0"), a1 = e.optLong("a1"),
+                        a2 = e.optLong("a2"), a3 = e.optLong("a3"),
+                        a4 = e.optLong("a4"), a5 = e.optLong("a5"),
+                        desc = e.optString("desc", "")
+                    ))
+                }
+            }
+
             DrainResult(
-                ok = j.optBoolean("ok", false),
-                events = events,
-                total = j.optLong("total", 0),
-                drained = j.optInt("drained", 0),
-                buffered = j.optInt("buffered", 0)
+                ok = true,
+                count = j.optInt("count", 0),
+                total = j.optInt("total", 0),
+                events = events
             )
         } catch (e: Exception) {
-            DrainResult()
+            DrainResult(false, error = "Parse error: ${e.message}")
         }
     }
-
-    fun parseEvents(json: String): DrainResult = parseDrain(json)
 
     fun parseSimple(json: String): SimpleResult {
         return try {
             val j = JSONObject(json)
             SimpleResult(
                 ok = j.optBoolean("ok", false),
-                msg = j.optString("msg", ""),
                 error = j.optString("error", "")
             )
         } catch (e: Exception) {
-            SimpleResult(error = e.message ?: "parse error")
+            SimpleResult(false, error = "Parse error: ${e.message}")
         }
     }
 
-    private fun parseEvent(j: JSONObject): SvcEvent {
-        return SvcEvent(
-            seq = j.optLong("seq", 0),
-            nr = j.optInt("nr", 0),
-            name = j.optString("name", nrToName(j.optInt("nr", 0))),
-            pid = j.optInt("pid", 0),
-            uid = j.optInt("uid", 0),
-            comm = j.optString("comm", ""),
-            a0 = j.optLong("a0", 0), a1 = j.optLong("a1", 0),
-            a2 = j.optLong("a2", 0), a3 = j.optLong("a3", 0),
-            a4 = j.optLong("a4", 0), a5 = j.optLong("a5", 0),
-            desc = j.optString("desc", ""),
-            caller = j.optString("caller", ""),
-            pc = j.optString("pc", ""),
-            fdPath = j.optString("fdPath", ""),
-            cloneFn = j.optLong("cloneFn", 0)
-        )
-    }
+    // ===== Syscall categories for UI =====
 
-    // ---- Syscall name resolution ----
+    data class SyscallEntry(val nr: Int, val name: String, val description: String)
+    data class SyscallCategory(val name: String, val icon: String, val syscalls: List<SyscallEntry>)
 
-    private val NR_NAMES = mapOf(
-        0 to "io_setup", 1 to "io_destroy", 2 to "io_submit", 3 to "io_cancel",
-        4 to "io_getevents", 5 to "setxattr", 8 to "getxattr", 11 to "listxattr",
-        14 to "removexattr", 17 to "getcwd", 19 to "eventfd2",
-        20 to "epoll_create1", 21 to "epoll_ctl", 22 to "epoll_pwait",
-        23 to "dup", 24 to "dup3", 25 to "fcntl", 26 to "inotify_init1",
-        27 to "inotify_add_watch", 28 to "inotify_rm_watch",
-        29 to "ioctl", 32 to "flock",
-        33 to "mknodat", 34 to "mkdirat", 35 to "unlinkat", 36 to "symlinkat",
-        37 to "linkat", 38 to "renameat", 39 to "umount2", 40 to "mount",
-        43 to "statfs", 44 to "fstatfs", 45 to "truncate", 46 to "ftruncate",
-        47 to "fallocate", 48 to "faccessat", 49 to "chdir",
-        52 to "fchmod", 53 to "fchmodat", 54 to "fchownat", 55 to "fchown",
-        56 to "openat", 57 to "close", 59 to "pipe2",
-        61 to "getdents64", 62 to "lseek", 63 to "read", 64 to "write",
-        65 to "readv", 66 to "writev", 67 to "pread64", 68 to "pwrite64",
-        71 to "sendfile", 72 to "pselect6", 73 to "ppoll",
-        76 to "splice", 78 to "readlinkat", 79 to "newfstatat",
-        80 to "fstat", 81 to "sync", 82 to "fsync", 83 to "fdatasync",
-        88 to "utimensat", 93 to "exit", 94 to "exit_group", 95 to "waitid",
-        96 to "set_tid_address", 97 to "unshare", 98 to "futex",
-        101 to "nanosleep", 105 to "init_module", 106 to "delete_module",
-        113 to "clock_gettime", 117 to "ptrace",
-        129 to "kill", 130 to "tkill", 131 to "tgkill",
-        134 to "rt_sigaction", 135 to "rt_sigprocmask",
-        137 to "rt_sigtimedwait", 138 to "rt_sigqueueinfo",
-        146 to "setuid", 147 to "setresuid", 149 to "setresgid",
-        151 to "setfsuid", 152 to "setfsgid",
-        154 to "setpgid", 160 to "uname", 167 to "prctl",
-        172 to "getpid", 173 to "getppid", 174 to "getuid", 175 to "geteuid",
-        176 to "getgid", 177 to "getegid", 178 to "gettid", 179 to "sysinfo",
-        186 to "msgget", 187 to "msgctl", 188 to "msgrcv", 189 to "msgsnd",
-        190 to "semget", 191 to "semctl", 192 to "semtimedop", 193 to "semop",
-        194 to "shmget", 195 to "shmctl", 196 to "shmat", 197 to "shmdt",
-        198 to "socket", 199 to "socketpair", 200 to "bind", 201 to "listen",
-        202 to "accept", 203 to "connect", 204 to "getsockname", 205 to "getpeername",
-        206 to "sendto", 207 to "recvfrom", 208 to "setsockopt", 209 to "getsockopt",
-        210 to "shutdown", 211 to "sendmsg", 212 to "recvmsg",
-        213 to "readahead", 214 to "brk", 215 to "munmap", 216 to "mremap",
-        220 to "clone", 221 to "execve", 222 to "mmap", 226 to "mprotect",
-        228 to "mlock", 229 to "munlock", 233 to "madvise",
-        240 to "rt_tgsigqueueinfo", 242 to "accept4", 243 to "recvmmsg",
-        260 to "wait4", 261 to "prlimit64",
-        268 to "setns", 269 to "sendmmsg",
-        273 to "finit_module", 276 to "renameat2", 277 to "seccomp",
-        278 to "getrandom", 279 to "memfd_create", 280 to "bpf", 281 to "execveat",
-        284 to "mlock2", 291 to "statx",
-        425 to "io_uring_setup", 426 to "io_uring_enter", 427 to "io_uring_register",
-        435 to "clone3", 436 to "close_range", 437 to "openat2", 439 to "faccessat2"
+    data class Preset(val id: String, val name: String, val description: String)
+
+    val presets = listOf(
+        Preset("re_basic", "re_basic", "逆向基础"),
+        Preset("re_full", "re_full", "逆向完整"),
+        Preset("file", "file", "文件监控"),
+        Preset("net", "net", "网络监控"),
+        Preset("proc", "proc", "进程监控"),
+        Preset("mem", "mem", "内存监控"),
+        Preset("security", "security", "安全审计"),
+        Preset("all", "all", "全部启用")
     )
 
-    fun nrToName(nr: Int): String = NR_NAMES.getOrDefault(nr, "syscall_$nr")
-
-    // ---- Syscall categories for UI ----
-
-    data class SyscallEntry(val nr: Int, val name: String)
-    data class SyscallCategory(val name: String, val entries: List<SyscallEntry>)
-
-    val SYSCALL_CATEGORIES = listOf(
-        SyscallCategory("File I/O", listOf(
-            SyscallEntry(56, "openat"), SyscallEntry(57, "close"),
-            SyscallEntry(63, "read"), SyscallEntry(64, "write"),
-            SyscallEntry(62, "lseek"), SyscallEntry(82, "fsync"),
-            SyscallEntry(83, "fdatasync"), SyscallEntry(71, "sendfile")
+    val categories = listOf(
+        SyscallCategory("文件操作", "📁", listOf(
+            SyscallEntry(56, "openat", "打开文件"),
+            SyscallEntry(57, "close", "关闭文件描述符"),
+            SyscallEntry(48, "faccessat", "检查文件访问权限"),
+            SyscallEntry(35, "unlinkat", "删除文件"),
+            SyscallEntry(78, "readlinkat", "读取符号链接"),
+            SyscallEntry(61, "getdents64", "读取目录"),
+            SyscallEntry(63, "read", "读取数据"),
+            SyscallEntry(64, "write", "写入数据"),
+            SyscallEntry(79, "newfstatat", "获取文件状态"),
+            SyscallEntry(291, "statx", "扩展文件状态"),
+            SyscallEntry(276, "renameat2", "重命名文件"),
+            SyscallEntry(34, "mkdirat", "创建目录")
         )),
-        SyscallCategory("Filesystem", listOf(
-            SyscallEntry(34, "mkdirat"), SyscallEntry(35, "unlinkat"),
-            SyscallEntry(53, "fchmodat"), SyscallEntry(54, "fchownat"),
-            SyscallEntry(48, "faccessat"), SyscallEntry(78, "readlinkat"),
-            SyscallEntry(276, "renameat2"), SyscallEntry(291, "statx")
+        SyscallCategory("进程管理", "⚙", listOf(
+            SyscallEntry(220, "clone", "创建进程/线程"),
+            SyscallEntry(221, "execve", "执行程序"),
+            SyscallEntry(281, "execveat", "执行程序(扩展)"),
+            SyscallEntry(93, "exit", "退出进程"),
+            SyscallEntry(94, "exit_group", "退出线程组"),
+            SyscallEntry(260, "wait4", "等待子进程"),
+            SyscallEntry(167, "prctl", "进程控制"),
+            SyscallEntry(117, "ptrace", "进程追踪")
         )),
-        SyscallCategory("Network", listOf(
-            SyscallEntry(198, "socket"), SyscallEntry(200, "bind"),
-            SyscallEntry(203, "connect"), SyscallEntry(206, "sendto"),
-            SyscallEntry(207, "recvfrom"), SyscallEntry(210, "shutdown"),
-            SyscallEntry(211, "sendmsg"), SyscallEntry(212, "recvmsg")
+        SyscallCategory("内存管理", "🧠", listOf(
+            SyscallEntry(222, "mmap", "内存映射"),
+            SyscallEntry(226, "mprotect", "修改内存保护"),
+            SyscallEntry(215, "munmap", "释放内存映射"),
+            SyscallEntry(214, "brk", "调整堆大小"),
+            SyscallEntry(233, "madvise", "内存使用建议"),
+            SyscallEntry(279, "memfd_create", "创建匿名文件"),
+            SyscallEntry(270, "process_vm_readv", "读取进程内存"),
+            SyscallEntry(271, "process_vm_writev", "写入进程内存")
         )),
-        SyscallCategory("Process", listOf(
-            SyscallEntry(220, "clone"), SyscallEntry(221, "execve"),
-            SyscallEntry(93, "exit"), SyscallEntry(260, "wait4"),
-            SyscallEntry(129, "kill"), SyscallEntry(131, "tgkill"),
-            SyscallEntry(167, "prctl"), SyscallEntry(435, "clone3")
+        SyscallCategory("网络通信", "🌐", listOf(
+            SyscallEntry(198, "socket", "创建套接字"),
+            SyscallEntry(200, "bind", "绑定地址"),
+            SyscallEntry(201, "listen", "监听连接"),
+            SyscallEntry(203, "connect", "发起连接"),
+            SyscallEntry(202, "accept", "接受连接"),
+            SyscallEntry(242, "accept4", "接受连接(扩展)"),
+            SyscallEntry(206, "sendto", "发送数据"),
+            SyscallEntry(207, "recvfrom", "接收数据")
         )),
-        SyscallCategory("Memory", listOf(
-            SyscallEntry(222, "mmap"), SyscallEntry(226, "mprotect"),
-            SyscallEntry(215, "munmap"), SyscallEntry(214, "brk"),
-            SyscallEntry(233, "madvise"), SyscallEntry(228, "mlock")
+        SyscallCategory("信号处理", "📡", listOf(
+            SyscallEntry(129, "kill", "发送信号"),
+            SyscallEntry(131, "tgkill", "发送线程信号"),
+            SyscallEntry(134, "rt_sigaction", "设置信号处理")
         )),
-        SyscallCategory("Security", listOf(
-            SyscallEntry(277, "seccomp"), SyscallEntry(280, "bpf"),
-            SyscallEntry(117, "ptrace"), SyscallEntry(273, "finit_module"),
-            SyscallEntry(146, "setuid"), SyscallEntry(268, "setns")
+        SyscallCategory("安全相关", "🔒", listOf(
+            SyscallEntry(277, "seccomp", "安全计算模式"),
+            SyscallEntry(268, "setns", "切换命名空间"),
+            SyscallEntry(97, "unshare", "取消共享"),
+            SyscallEntry(280, "bpf", "BPF操作")
+        )),
+        SyscallCategory("Tier2 扩展", "➕", listOf(
+            SyscallEntry(29, "ioctl", "设备控制"),
+            SyscallEntry(62, "lseek", "文件定位"),
+            SyscallEntry(65, "readv", "分散读"),
+            SyscallEntry(66, "writev", "聚集写"),
+            SyscallEntry(25, "fcntl", "文件控制"),
+            SyscallEntry(71, "sendfile", "文件间传输"),
+            SyscallEntry(211, "sendmsg", "发送消息"),
+            SyscallEntry(212, "recvmsg", "接收消息"),
+            SyscallEntry(208, "setsockopt", "设置套接字选项"),
+            SyscallEntry(209, "getsockopt", "获取套接字选项"),
+            SyscallEntry(40, "mount", "挂载文件系统"),
+            SyscallEntry(39, "umount2", "卸载文件系统"),
+            SyscallEntry(261, "prlimit64", "资源限制"),
+            SyscallEntry(90, "capget", "获取能力"),
+            SyscallEntry(91, "capset", "设置能力"),
+            SyscallEntry(146, "setuid", "设置用户ID"),
+            SyscallEntry(144, "setgid", "设置组ID"),
+            SyscallEntry(273, "finit_module", "加载内核模块(fd)"),
+            SyscallEntry(105, "init_module", "加载内核模块"),
+            SyscallEntry(106, "delete_module", "卸载内核模块")
         ))
     )
+
+    private val nrNameMap: Map<Int, String> by lazy {
+        val m = HashMap<Int, String>()
+        for (cat in categories) {
+            for (s in cat.syscalls) {
+                m[s.nr] = s.name
+            }
+        }
+        m
+    }
+
+    fun nrToName(nr: Int): String = nrNameMap[nr] ?: "nr$nr"
+
+    private val nrCategoryMap: Map<Int, String> by lazy {
+        val m = HashMap<Int, String>()
+        for (cat in categories) {
+            for (s in cat.syscalls) {
+                m[s.nr] = cat.name
+            }
+        }
+        m
+    }
+
+    fun syscallCategory(nr: Int): String = nrCategoryMap[nr] ?: "-"
 }

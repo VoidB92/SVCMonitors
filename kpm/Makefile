@@ -1,32 +1,36 @@
-ifndef TARGET_COMPILE
-TARGET_COMPILE = /opt/homebrew/bin/aarch64-none-elf-
-endif
+KERNEL_DIR ?= $(KP_DIR)/kernel
+CROSS_COMPILE ?= aarch64-linux-gnu-
 
-ifndef KP_DIR
-KP_DIR = ../KernelPatch
-endif
+CC = $(CROSS_COMPILE)gcc
+LD = $(CROSS_COMPILE)ld
 
-CC = $(TARGET_COMPILE)gcc
-LD = $(TARGET_COMPILE)ld
+INCLUDE = -I$(KERNEL_DIR)/include \
+          -I$(KERNEL_DIR)/patch/include \
+          -I$(KERNEL_DIR)/linux/include \
+          -I$(KERNEL_DIR)/linux/include/uapi \
+          -I$(KERNEL_DIR)/linux/arch/arm64/include \
+          -I$(KERNEL_DIR)/linux/tools/arch/arm64/include \
+          -I$(KERNEL_DIR)/linux/arch/arm64/include/uapi
 
-INCLUDE_DIRS := include patch/include linux/include linux/include/uapi linux/arch/arm64/include linux/arch/arm64/include/uapi linux/tools/arch/arm64/include
-INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
+CFLAGS = -Wall -O2 -fno-pic -fno-stack-protector \
+         -nostdlib -nostdinc -ffreestanding \
+         -fno-builtin -fno-tree-loop-distribute-patterns \
+         -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memcmp \
+         -mgeneral-regs-only \
+         $(INCLUDE)
 
-TARGET = svc-monitor.kpm
-objs := svc_monitor.o
+LDFLAGS = -r
+
+TARGET = svc_monitor.kpm
 
 all: $(TARGET)
 
-$(TARGET): $(objs)
-	$(CC) -r -o $@ $^
+$(TARGET): src/svc_monitor.c
+	$(CC) $(CFLAGS) -c $< -o svc_monitor.o
+	$(LD) $(LDFLAGS) svc_monitor.o -o $@
+	rm -f svc_monitor.o
 
-svc_monitor.o: src/svc_monitor.c
-	$(CC) $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -fno-builtin \
-		-fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memcmp \
-		-fno-tree-loop-distribute-patterns \
-		-o $@ $<
-
-.PHONY: clean
 clean:
-	rm -rf *.kpm
-	rm -f $(objs)
+	rm -f $(TARGET) svc_monitor.o
+
+.PHONY: all clean

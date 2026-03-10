@@ -1,2 +1,0 @@
--keepclassmembers class com.svcmonitor.app.** { *; }
--keep class com.svcmonitor.app.StatusParser$* { *; }

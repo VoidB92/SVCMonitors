@@ -1,10 +1,10 @@
 {
     "logs": [
         {
-            "outputFile": "com.svcmonitor.app-mergeDebugResources-34:/values-en-rXC/values-en-rXC.xml",
+            "outputFile": "com.svcmonitor.app-mergeDebugResources-24:/values-en-rXC/values-en-rXC.xml",
             "map": [
                 {
-                    "source": "/Users/bytedance/.gradle/caches/transforms-3/4e116a93cb58fedfe700f980927d2f70/transformed/core-1.12.0/res/values-en-rXC/values-en-rXC.xml",
+                    "source": "/Users/bytedance/.gradle/caches/transforms-3/38d493e2ce29318e8dafa8790c6ef333/transformed/core-1.10.1/res/values-en-rXC/values-en-rXC.xml",
                     "from": {
                         "startLines": "2,3,4,5,6,7,8,9",
                         "startColumns": "4,4,4,4,4,4,4,4",

@@ -651,9 +651,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showEventDetail(evt: StatusParser.SvcEvent) {
         vm.viewModelScope_launch {
-            val pcResolved = resolveAddress(evt.pid, evt.pc)
-            val callerResolved = resolveAddress(evt.pid, evt.caller)
-            val cloneResolved = if (evt.cloneFn != 0L) resolveAddress(evt.pid, evt.cloneFn) else ""
+            val pcResolved = formatAddrSoOffset(evt.pid, evt.pc)
+            val callerResolved = formatAddrSoOffset(evt.pid, evt.caller)
+            val cloneResolved = if (evt.cloneFn != 0L) formatAddrSoOffset(evt.pid, evt.cloneFn) else ""
 
             val fdResolved = if (nrUsesFd(evt.nr)) {
                 val r = KpmBridge.readProcFdLink(evt.pid, evt.a0)
@@ -670,10 +670,10 @@ class MainActivity : AppCompatActivity() {
                 appendLine("PID: ${evt.pid}  UID: ${evt.uid}")
                 appendLine("进程名: ${evt.comm}")
                 appendLine()
-                appendLine("pc: 0x${java.lang.Long.toHexString(evt.pc)}${if (pcResolved.isNotEmpty()) "  →  $pcResolved" else ""}")
-                appendLine("caller: 0x${java.lang.Long.toHexString(evt.caller)}${if (callerResolved.isNotEmpty()) "  →  $callerResolved" else ""}")
+                appendLine("pc: $pcResolved")
+                appendLine("caller: $callerResolved")
                 if (evt.nr == 220 && evt.cloneFn != 0L) {
-                    appendLine("clone_fn: 0x${java.lang.Long.toHexString(evt.cloneFn)}${if (cloneResolved.isNotEmpty()) "  →  $cloneResolved" else ""}")
+                    appendLine("clone_fn: $cloneResolved")
                 }
                 if (fdResolved.isNotEmpty()) {
                     appendLine("fd(${evt.a0}): $fdResolved")
@@ -931,9 +931,15 @@ class MainActivity : AppCompatActivity() {
         if (pid <= 0 || addr == 0L) return ""
         val maps = KpmBridge.readProcMaps(pid)
         if (maps.isBlank()) return ""
-        val entry = findMapEntry(maps, addr) ?: return "unmapped@0x${java.lang.Long.toHexString(addr)}"
+        val entry = findMapEntry(maps, addr) ?: return ""
         val name = if (entry.path.isNotBlank()) entry.path.substringAfterLast('/') else "[anon]"
         return "$name+0x${java.lang.Long.toHexString(entry.fileOffset)}"
+    }
+
+    private suspend fun formatAddrSoOffset(pid: Int, addr: Long): String {
+        val abs = "0x${java.lang.Long.toHexString(addr)}"
+        val so = resolveAddress(pid, addr)
+        return if (so.isNotEmpty()) "$so ($abs)" else "$abs (unmapped)"
     }
 
     private fun findMapEntry(maps: String, addr: Long): MapEntry? {

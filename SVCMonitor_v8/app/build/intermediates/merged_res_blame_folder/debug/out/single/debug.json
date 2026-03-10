@@ -2,9 +2,5 @@
     {
         "merged": "com.svcmonitor.app-merged_res-26:/xml_file_paths.xml.flat",
         "source": "com.svcmonitor.app-main-28:/xml/file_paths.xml"
-    },
-    {
-        "merged": "/Users/bytedance/.gradle/daemon/8.2.1/com.svcmonitor.app-merged_res-26:/xml_file_paths.xml.flat",
-        "source": "/Users/bytedance/.gradle/daemon/8.2.1/com.svcmonitor.app-main-28:/xml/file_paths.xml"
     }
 ]

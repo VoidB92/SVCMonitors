@@ -1,37 +1,44 @@
-/* svc_monitor.c - KPM v8.3.0
+/* svc_monitor.c - KPM v9.0.0
  * ARM64 SVC system-call monitor for Pixel 6 / Android 12 / kernel 5.10.43
  * KernelPatch Module - CTL0 command interface
  *
- * Symbol-safe: every API used below is either:
- *   (a) provided by the KPM SDK (kfunc_*, raw_syscall*, hook_syscall*, compat_*),
- *   (b) a compiler built-in (__builtin_memset/memcpy), or
- *   (c) declared in linux/string.h or linux/printk.h which are available to KPM.
- *
- * v8.3 fixes vs v8.2:
- *   - current->pid  replaced with raw_syscall0(__NR_gettid)
- *   - current->cred->uid replaced with current_uid()
- *   - comm read via TASK_COMM_OFFSET=2560 with ASCII validation fallback
- *   - safe_copy_user_bytes uses compat_copy_from_user (binary-safe)
- *   - safe_read_user_ptr  uses compat_copy_from_user
- *   - per-event monotonic sequence number (g_seq)
- *   - output buffer 128 KB
- *   - __attribute__((used)) on exported entry points
+ * v9.0.0 critical fixes vs v8.3:
+ *   1. hook_syscalln() called with correct 5 params (nr, narg, before, after, udata)
+ *   2. unhook_syscalln() replaces non-existent unhook_syscall()
+ *   3. compat_strncpy_from_user replaces non-existent compat_copy_from_user
+ *   4. syscall_args(fargs) used for correct arg extraction (has_syscall_wrapper)
+ *   5. SO+offset caller resolution via /proc/<pid>/maps
+ *   6. Comprehensive parameter parsing for all monitored syscalls
  */
 
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/kernel.h>
 #include <linux/string.h>
 #include <kputils.h>
 #include <syscall.h>
-#include <asm/current.h>
 
 KPM_NAME("svc_monitor");
-KPM_VERSION("8.3.0");
+KPM_VERSION("9.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("SVC Monitor");
-KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
+KPM_DESCRIPTION("ARM64 SVC syscall monitor with SO+offset resolution");
+
+static void kp_memset(void *dst, int c, unsigned long n)
+{
+    unsigned long i;
+    volatile unsigned char *d = (volatile unsigned char *)dst;
+    unsigned char v = (unsigned char)c;
+    for (i = 0; i < n; i++) d[i] = v;
+}
+
+static void kp_memcpy(void *dst, const void *src, unsigned long n)
+{
+    unsigned long i;
+    volatile unsigned char *d = (volatile unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    for (i = 0; i < n; i++) d[i] = s[i];
+}
 
 /* ================================================================
  * Syscall number definitions (ARM64, kernel 5.10)
@@ -70,6 +77,7 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_umount2            39
 #define __NR_mount              40
 #define __NR_pivot_root         41
+#define __NR_nfsservctl         42
 #define __NR_statfs             43
 #define __NR_fstatfs            44
 #define __NR_truncate           45
@@ -77,6 +85,8 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_fallocate          47
 #define __NR_faccessat          48
 #define __NR_chdir              49
+#define __NR_fchdir             50
+#define __NR_chroot             51
 #define __NR_fchmod             52
 #define __NR_fchmodat           53
 #define __NR_fchownat           54
@@ -94,18 +104,22 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_writev             66
 #define __NR_pread64            67
 #define __NR_pwrite64           68
+#define __NR_preadv             69
+#define __NR_pwritev            70
 #define __NR_sendfile           71
 #define __NR_pselect6           72
 #define __NR_ppoll              73
 #define __NR_signalfd4          74
+#define __NR_vmsplice           75
 #define __NR_splice             76
 #define __NR_tee                77
 #define __NR_readlinkat         78
-#define __NR_newfstatat         79
+#define __NR_fstatat            79
 #define __NR_fstat              80
 #define __NR_sync               81
 #define __NR_fsync              82
 #define __NR_fdatasync          83
+#define __NR_sync_file_range    84
 #define __NR_timerfd_create     85
 #define __NR_timerfd_settime    86
 #define __NR_timerfd_gettime    87
@@ -148,7 +162,7 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_sched_yield        124
 #define __NR_sched_get_priority_max 125
 #define __NR_sched_get_priority_min 126
-#define __NR_sched_rr_get_interval 127
+#define __NR_sched_rr_get_interval  127
 #define __NR_restart_syscall    128
 #define __NR_kill               129
 #define __NR_tkill              130
@@ -265,7 +279,6 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_perf_event_open    241
 #define __NR_accept4            242
 #define __NR_recvmmsg           243
-#define __NR_arch_specific_syscall 244
 #define __NR_wait4              260
 #define __NR_prlimit64          261
 #define __NR_fanotify_init      262
@@ -294,10 +307,23 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_copy_file_range    285
 #define __NR_preadv2            286
 #define __NR_pwritev2           287
+#define __NR_pkey_mprotect      288
+#define __NR_pkey_alloc         289
+#define __NR_pkey_free          290
 #define __NR_statx              291
+#define __NR_io_pgetevents      292
+#define __NR_rseq               293
+#define __NR_kexec_file_load    294
+#define __NR_pidfd_send_signal  424
 #define __NR_io_uring_setup     425
 #define __NR_io_uring_enter     426
 #define __NR_io_uring_register  427
+#define __NR_open_tree          428
+#define __NR_move_mount         429
+#define __NR_fsopen             430
+#define __NR_fsconfig           431
+#define __NR_fsmount            432
+#define __NR_fspick             433
 #define __NR_pidfd_open         434
 #define __NR_clone3             435
 #define __NR_close_range        436
@@ -306,1228 +332,1904 @@ KPM_DESCRIPTION("ARM64 SVC syscall monitor with deep argument parsing");
 #define __NR_faccessat2         439
 
 /* ================================================================
- * Architecture / buffer constants
+ * Data structures and configuration
  * ================================================================ */
-#define THREAD_SIZE      16384
-#define PT_REGS_SIZE     272
-#define REGS_OFFSET      (THREAD_SIZE - PT_REGS_SIZE)
-#define REG_X0           0
-#define REG_X8           8
-#define REG_PC           32
-#define TASK_COMM_OFFSET 2560
-#define TASK_COMM_LEN    16
 
-#define MAX_EVENTS       1024
-#define MAX_STR_LEN      256
-#define MAX_DESC_LEN     512
-#define MAX_PATH_LEN     256
-#define OUTBUF_SIZE      131072
-#define OUTPUT_PATH      "/data/local/tmp/svc_out.json"
+#define MAX_EVENTS          1024
+#define MAX_HOOKS           128
+#define MAX_PATH_LEN        256
+#define MAX_ARG_STR         128
+#define MAX_COMM_LEN        16
+#define OUTPUT_BUF_SIZE     (128 * 1024)
+#define MAPS_CACHE_SIZE     64
+#define MAPS_LINE_BUF       512
 
-#define BITMAP_BITS      512
-#define BITMAP_LONGS     (BITMAP_BITS / 64)
-
-/* ================================================================
- * Data structures
- * ================================================================ */
+/* Event structure */
 struct svc_event {
-    unsigned long seq;
+    unsigned long long timestamp;
+    unsigned int seq;
     int nr;
     int pid;
-    int uid;
-    char comm[TASK_COMM_LEN];
-    unsigned long a0, a1, a2, a3, a4, a5;
-    char desc[MAX_DESC_LEN];
-    unsigned long caller_addr;
-    unsigned long pc;
-    char fd_path[MAX_PATH_LEN];
-    unsigned long clone_fn;
+    int tid;
+    unsigned int uid;
+    char comm[MAX_COMM_LEN];
+    unsigned long long args[6];
+    char arg_detail[512];
+    unsigned long long caller_pc;
+    unsigned long long caller_lr;
+    char caller_so[MAX_PATH_LEN];
+    unsigned long long caller_offset;
+};
+
+/* Maps cache entry for SO resolution */
+struct maps_entry {
+    unsigned long long vm_start;
+    unsigned long long vm_end;
+    unsigned long long pgoff;
+    char name[MAX_PATH_LEN];
+};
+
+struct pid_maps {
+    int pid;
+    int count;
+    unsigned long long update_time;
+    struct maps_entry entries[MAPS_CACHE_SIZE];
 };
 
 /* ================================================================
- * Global state
+ * Globals
  * ================================================================ */
+
+static int g_running = 0;
+static int g_initialized = 0;
+static unsigned int g_seq = 0;
+
+/* Event ring buffer */
 static struct svc_event g_events[MAX_EVENTS];
-static volatile int g_head = 0;
-static volatile int g_tail = 0;
-static volatile int g_count = 0;
-static volatile unsigned long g_total = 0;
-static volatile unsigned long g_seq = 0;
+static int g_ev_head = 0;
+static int g_ev_tail = 0;
+static int g_ev_count = 0;
+static int g_ev_dropped = 0;
 
-static volatile int g_enabled = 0;
-static volatile int g_uid_filter = -1;
-static volatile int g_tier2_enabled = 0;
+/* Hook tracking */
+static int g_hooked_nrs[MAX_HOOKS];
+static int g_hook_count = 0;
 
-static unsigned long g_nr_bitmap[BITMAP_LONGS];
+/* Target filter */
+static int g_target_pid = 0;
+static unsigned int g_target_uid = 0;
+static char g_target_comm[MAX_COMM_LEN] = {0};
 
-static char g_outbuf[OUTBUF_SIZE];
+/* Monitored syscall bitmap */
+#define BITMAP_SIZE 16
+static unsigned long g_bitmap[BITMAP_SIZE] = {0};
+
+/* Maps cache for SO resolution (single-target) */
+static struct pid_maps g_maps_cache = {0};
+
+/* Output buffer */
+static char g_outbuf[OUTPUT_BUF_SIZE];
+static int g_outpos = 0;
+
+/* Re-entrancy guard */
+static int g_in_hook = 0;
+
 
 /* ================================================================
  * Syscall name table
  * ================================================================ */
+
 struct nr_name { int nr; const char *name; };
-static const struct nr_name nr_names[] = {
+static const struct nr_name g_syscall_names[] = {
     {0,"io_setup"},{1,"io_destroy"},{2,"io_submit"},{3,"io_cancel"},
     {4,"io_getevents"},{5,"setxattr"},{8,"getxattr"},{11,"listxattr"},
-    {14,"removexattr"},{17,"getcwd"},{18,"lookup_dcookie"},{19,"eventfd2"},
-    {20,"epoll_create1"},{21,"epoll_ctl"},{22,"epoll_pwait"},
-    {23,"dup"},{24,"dup3"},{25,"fcntl"},{26,"inotify_init1"},
-    {27,"inotify_add_watch"},{28,"inotify_rm_watch"},
-    {29,"ioctl"},{30,"ioprio_set"},{31,"ioprio_get"},{32,"flock"},
-    {33,"mknodat"},{34,"mkdirat"},{35,"unlinkat"},{36,"symlinkat"},
-    {37,"linkat"},{38,"renameat"},{39,"umount2"},{40,"mount"},
-    {43,"statfs"},{44,"fstatfs"},{45,"truncate"},{46,"ftruncate"},
-    {47,"fallocate"},{48,"faccessat"},{49,"chdir"},
-    {52,"fchmod"},{53,"fchmodat"},{54,"fchownat"},{55,"fchown"},
-    {56,"openat"},{57,"close"},{58,"vhangup"},{59,"pipe2"},
-    {61,"getdents64"},{62,"lseek"},{63,"read"},{64,"write"},
-    {65,"readv"},{66,"writev"},{67,"pread64"},{68,"pwrite64"},
-    {71,"sendfile"},{72,"pselect6"},{73,"ppoll"},
-    {76,"splice"},{77,"tee"},{78,"readlinkat"},{79,"newfstatat"},
-    {80,"fstat"},{81,"sync"},{82,"fsync"},{83,"fdatasync"},
-    {85,"timerfd_create"},{86,"timerfd_settime"},{87,"timerfd_gettime"},
-    {88,"utimensat"},{89,"acct"},
-    {90,"capget"},{91,"capset"},{92,"personality"},
-    {93,"exit"},{94,"exit_group"},{95,"waitid"},
-    {96,"set_tid_address"},{97,"unshare"},{98,"futex"},
-    {99,"set_robust_list"},{100,"get_robust_list"},
-    {101,"nanosleep"},{102,"getitimer"},{103,"setitimer"},
-    {105,"init_module"},{106,"delete_module"},
-    {107,"timer_create"},{108,"timer_gettime"},{109,"timer_getoverrun"},
-    {110,"timer_settime"},{111,"timer_delete"},
-    {112,"clock_settime"},{113,"clock_gettime"},{114,"clock_getres"},
-    {115,"clock_nanosleep"},{116,"syslog"},{117,"ptrace"},
-    {118,"sched_setparam"},{119,"sched_setscheduler"},
-    {120,"sched_getscheduler"},{121,"sched_getparam"},
-    {122,"sched_setaffinity"},{123,"sched_getaffinity"},
-    {124,"sched_yield"},{125,"sched_get_priority_max"},
-    {126,"sched_get_priority_min"},{127,"sched_rr_get_interval"},
-    {128,"restart_syscall"},{129,"kill"},{130,"tkill"},{131,"tgkill"},
-    {132,"sigaltstack"},{133,"rt_sigsuspend"},{134,"rt_sigaction"},
-    {135,"rt_sigprocmask"},{136,"rt_sigpending"},{137,"rt_sigtimedwait"},
-    {138,"rt_sigqueueinfo"},{139,"rt_sigreturn"},
-    {140,"setpriority"},{141,"getpriority"},{142,"reboot"},
-    {143,"setregid"},{144,"setgid"},{145,"setreuid"},{146,"setuid"},
-    {147,"setresuid"},{148,"getresuid"},{149,"setresgid"},{150,"getresgid"},
-    {151,"setfsuid"},{152,"setfsgid"},{153,"times"},
-    {154,"setpgid"},{155,"getpgid"},{156,"getsid"},{157,"setsid"},
-    {158,"getgroups"},{159,"setgroups"},{160,"uname"},
-    {163,"getrlimit"},{164,"setrlimit"},{165,"getrusage"},
-    {166,"umask"},{167,"prctl"},{168,"getcpu"},
-    {169,"gettimeofday"},{170,"settimeofday"},
-    {172,"getpid"},{173,"getppid"},{174,"getuid"},{175,"geteuid"},
-    {176,"getgid"},{177,"getegid"},{178,"gettid"},{179,"sysinfo"},
-    {180,"mq_open"},{181,"mq_unlink"},{182,"mq_timedsend"},
-    {183,"mq_timedreceive"},{184,"mq_notify"},{185,"mq_getsetattr"},
+    {14,"removexattr"},{17,"getcwd"},{19,"eventfd2"},{20,"epoll_create1"},
+    {21,"epoll_ctl"},{22,"epoll_pwait"},{23,"dup"},{24,"dup3"},
+    {25,"fcntl"},{26,"inotify_init1"},{27,"inotify_add_watch"},
+    {28,"inotify_rm_watch"},{29,"ioctl"},{30,"ioprio_set"},{31,"ioprio_get"},
+    {32,"flock"},{33,"mknodat"},{34,"mkdirat"},{35,"unlinkat"},
+    {36,"symlinkat"},{37,"linkat"},{38,"renameat"},{39,"umount2"},
+    {40,"mount"},{43,"statfs"},{44,"fstatfs"},{45,"truncate"},
+    {46,"ftruncate"},{47,"fallocate"},{48,"faccessat"},{49,"chdir"},
+    {50,"fchdir"},{51,"chroot"},{52,"fchmod"},{53,"fchmodat"},
+    {54,"fchownat"},{55,"fchown"},{56,"openat"},{57,"close"},
+    {59,"pipe2"},{61,"getdents64"},{62,"lseek"},{63,"read"},
+    {64,"write"},{65,"readv"},{66,"writev"},{67,"pread64"},
+    {68,"pwrite64"},{71,"sendfile"},{72,"pselect6"},{73,"ppoll"},
+    {76,"splice"},{78,"readlinkat"},{79,"fstatat"},{80,"fstat"},
+    {81,"sync"},{82,"fsync"},{83,"fdatasync"},{85,"timerfd_create"},
+    {88,"utimensat"},{89,"acct"},{90,"capget"},{91,"capset"},
+    {93,"exit"},{94,"exit_group"},{95,"waitid"},{96,"set_tid_address"},
+    {97,"unshare"},{98,"futex"},{99,"set_robust_list"},
+    {100,"get_robust_list"},{101,"nanosleep"},{103,"setitimer"},
+    {104,"kexec_load"},{105,"init_module"},{106,"delete_module"},
+    {113,"clock_gettime"},{114,"clock_getres"},{115,"clock_nanosleep"},
+    {116,"syslog"},{117,"ptrace"},{124,"sched_yield"},
+    {129,"kill"},{130,"tkill"},{131,"tgkill"},{132,"sigaltstack"},
+    {134,"rt_sigaction"},{135,"rt_sigprocmask"},{140,"setpriority"},
+    {141,"getpriority"},{142,"reboot"},{146,"setuid"},{147,"setresuid"},
+    {153,"times"},{154,"setpgid"},{157,"setsid"},{160,"uname"},
+    {163,"getrlimit"},{164,"setrlimit"},{166,"umask"},{167,"prctl"},
+    {168,"getcpu"},{169,"gettimeofday"},{172,"getpid"},{173,"getppid"},
+    {174,"getuid"},{175,"geteuid"},{176,"getgid"},{177,"getegid"},
+    {178,"gettid"},{179,"sysinfo"},
     {186,"msgget"},{187,"msgctl"},{188,"msgrcv"},{189,"msgsnd"},
-    {190,"semget"},{191,"semctl"},{192,"semtimedop"},{193,"semop"},
-    {194,"shmget"},{195,"shmctl"},{196,"shmat"},{197,"shmdt"},
+    {190,"semget"},{191,"semctl"},{194,"shmget"},{195,"shmctl"},
+    {196,"shmat"},{197,"shmdt"},
     {198,"socket"},{199,"socketpair"},{200,"bind"},{201,"listen"},
     {202,"accept"},{203,"connect"},{204,"getsockname"},{205,"getpeername"},
     {206,"sendto"},{207,"recvfrom"},{208,"setsockopt"},{209,"getsockopt"},
     {210,"shutdown"},{211,"sendmsg"},{212,"recvmsg"},
-    {213,"readahead"},{214,"brk"},{215,"munmap"},{216,"mremap"},
-    {217,"add_key"},{218,"request_key"},{219,"keyctl"},
+    {214,"brk"},{215,"munmap"},{216,"mremap"},
     {220,"clone"},{221,"execve"},{222,"mmap"},{223,"fadvise64"},
-    {224,"swapon"},{225,"swapoff"},
     {226,"mprotect"},{227,"msync"},{228,"mlock"},{229,"munlock"},
-    {230,"mlockall"},{231,"munlockall"},{232,"mincore"},{233,"madvise"},
-    {241,"perf_event_open"},{242,"accept4"},{243,"recvmmsg"},
-    {260,"wait4"},{261,"prlimit64"},
-    {262,"fanotify_init"},{263,"fanotify_mark"},
-    {267,"syncfs"},{268,"setns"},{269,"sendmmsg"},
-    {270,"process_vm_readv"},{271,"process_vm_writev"},
-    {272,"kcmp"},{273,"finit_module"},
-    {274,"sched_setattr"},{275,"sched_getattr"},
-    {276,"renameat2"},{277,"seccomp"},{278,"getrandom"},
-    {279,"memfd_create"},{280,"bpf"},{281,"execveat"},
-    {282,"userfaultfd"},{283,"membarrier"},{284,"mlock2"},
-    {285,"copy_file_range"},{286,"preadv2"},{287,"pwritev2"},
-    {291,"statx"},
-    {425,"io_uring_setup"},{426,"io_uring_enter"},{427,"io_uring_register"},
-    {434,"pidfd_open"},{435,"clone3"},{436,"close_range"},
-    {437,"openat2"},{438,"pidfd_getfd"},{439,"faccessat2"},
+    {233,"madvise"},
+    {240,"rt_tgsigqueueinfo"},{241,"perf_event_open"},{242,"accept4"},
+    {260,"wait4"},{261,"prlimit64"},{268,"setns"},{269,"sendmmsg"},
+    {270,"process_vm_readv"},{271,"process_vm_writev"},{272,"kcmp"},
+    {273,"finit_module"},{276,"renameat2"},{277,"seccomp"},
+    {278,"getrandom"},{279,"memfd_create"},{280,"bpf"},{281,"execveat"},
+    {284,"mlock2"},{285,"copy_file_range"},{291,"statx"},
+    {424,"pidfd_send_signal"},{425,"io_uring_setup"},{426,"io_uring_enter"},
+    {427,"io_uring_register"},{434,"pidfd_open"},{435,"clone3"},
+    {436,"close_range"},{437,"openat2"},{438,"pidfd_getfd"},
+    {439,"faccessat2"},
     {-1, 0}
 };
 
-static const char *nr_to_name(int nr) {
-    int i;
-    for (i = 0; nr_names[i].nr >= 0; i++) {
-        if (nr_names[i].nr == nr) return nr_names[i].name;
+static const char *get_syscall_name(int nr)
+{
+    const struct nr_name *p = g_syscall_names;
+    while (p->nr >= 0) {
+        if (p->nr == nr) return p->name;
+        p++;
     }
     return "unknown";
 }
 
 /* ================================================================
- * Bitmap operations for NR filter
+ * Bitmap operations
  * ================================================================ */
-static void bitmap_set(int nr) {
-    if (nr >= 0 && nr < BITMAP_BITS)
-        g_nr_bitmap[nr / 64] |= (1UL << (nr % 64));
+
+static void bitmap_set(int nr)
+{
+    if (nr < 0 || nr >= BITMAP_SIZE * 64) return;
+    g_bitmap[nr / 64] |= (1UL << (nr % 64));
 }
-static void bitmap_clear(int nr) {
-    if (nr >= 0 && nr < BITMAP_BITS)
-        g_nr_bitmap[nr / 64] &= ~(1UL << (nr % 64));
+
+static void bitmap_clear(int nr)
+{
+    if (nr < 0 || nr >= BITMAP_SIZE * 64) return;
+    g_bitmap[nr / 64] &= ~(1UL << (nr % 64));
 }
-static int bitmap_test(int nr) {
-    if (nr < 0 || nr >= BITMAP_BITS) return 0;
-    return (g_nr_bitmap[nr / 64] >> (nr % 64)) & 1;
+
+static int bitmap_test(int nr)
+{
+    if (nr < 0 || nr >= BITMAP_SIZE * 64) return 0;
+    return (g_bitmap[nr / 64] >> (nr % 64)) & 1;
 }
-static void bitmap_set_all(void) {
-    int i;
-    for (i = 0; i < BITMAP_LONGS; i++)
-        g_nr_bitmap[i] = ~0UL;
-}
-static void bitmap_clear_all(void) {
-    int i;
-    for (i = 0; i < BITMAP_LONGS; i++)
-        g_nr_bitmap[i] = 0UL;
-}
-static int bitmap_any_set(void) {
-    int i;
-    for (i = 0; i < BITMAP_LONGS; i++)
-        if (g_nr_bitmap[i]) return 1;
-    return 0;
-}
-static int bitmap_list(char *buf, int buflen) {
-    int i, off = 0, first = 1;
-    for (i = 0; i < BITMAP_BITS && off < buflen - 8; i++) {
-        if (bitmap_test(i)) {
-            off += snprintf(buf + off, buflen - off, "%s%d", first ? "" : ",", i);
-            first = 0;
-        }
-    }
-    if (off == 0) { buf[0] = 0; }
-    return off;
+
+static void bitmap_clear_all(void)
+{
+    kp_memset(g_bitmap, 0, sizeof(g_bitmap));
 }
 
 /* ================================================================
- * Safe user-space access helpers (KPM-safe)
+ * Safe user-space reading (v9 fix: use compat_strncpy_from_user)
  * ================================================================ */
-static int safe_copy_user_bytes(void *dst, unsigned long user_addr, int maxlen) {
-    int i;
-    volatile char *vdst = (volatile char *)dst;
-    if (!user_addr || !maxlen) return 0;
-    for (i = 0; i < maxlen; i++) vdst[i] = 0;
-    if (compat_strncpy_from_user((char *)dst, (const char __user *)user_addr, maxlen - 1) < 0) {
-        for (i = 0; i < maxlen; i++) vdst[i] = 0;
-        return -1;
+
+static long safe_strncpy_user(char *dst, unsigned long user_addr, long maxlen)
+{
+    long ret;
+    if (!user_addr || maxlen <= 0) {
+        if (maxlen > 0) dst[0] = '\0';
+        return 0;
     }
-    ((char *)dst)[maxlen - 1] = 0;
-    return 0;
+    ret = compat_strncpy_from_user(dst, (const char __user *)user_addr, maxlen);
+    if (ret < 0) {
+        dst[0] = '\0';
+        return 0;
+    }
+    if (ret >= maxlen)
+        dst[maxlen - 1] = '\0';
+    return ret;
 }
 
 /* ================================================================
- * Get current task info (KPM-safe, no unexported symbols)
+ * Process info helpers (using raw_syscall for safety)
  * ================================================================ */
-static int get_current_pid(void) {
+
+static int get_current_pid(void)
+{
+    return (int)raw_syscall0(__NR_getpid);
+}
+
+static int get_current_tid(void)
+{
     return (int)raw_syscall0(__NR_gettid);
 }
 
-static int get_current_uid(void) {
+static unsigned int get_current_uid(void)
+{
     return current_uid();
 }
 
-static void get_current_comm(char *buf, int len) {
-    char *task = (char *)current;
+/* Read comm from /proc/self/comm via task struct offset */
+#define TASK_COMM_OFFSET 2560
+
+static void get_current_comm(char *buf, int size)
+{
+    unsigned long current_task;
     int i, valid;
-    if (!task || len < 2) { buf[0] = 0; return; }
-    for (i = 0; i < (len < TASK_COMM_LEN ? len : TASK_COMM_LEN); i++) {
-        buf[i] = (task + TASK_COMM_OFFSET)[i];
+
+    __asm__ volatile("mrs %0, sp_el0" : "=r"(current_task));
+    if (!current_task) {
+        buf[0] = '?'; buf[1] = '\0';
+        return;
     }
-    buf[len - 1] = 0;
+
+    kp_memcpy(buf, (void *)(current_task + TASK_COMM_OFFSET),
+              size < MAX_COMM_LEN ? size : MAX_COMM_LEN);
+    buf[size - 1] = '\0';
+
+    /* Validate ASCII */
     valid = 1;
-    for (i = 0; i < len && buf[i]; i++) {
+    for (i = 0; i < size && buf[i]; i++) {
         if (buf[i] < 0x20 || buf[i] > 0x7e) { valid = 0; break; }
     }
-    if (!valid || buf[0] == 0) {
-        buf[0] = '?'; buf[1] = '?'; buf[2] = '?'; buf[3] = 0;
+    if (!valid || buf[0] == '\0') {
+        buf[0] = '?'; buf[1] = '\0';
     }
 }
 
 /* ================================================================
- * JSON string escape (KPM-safe, no dynamic allocation)
+ * JSON escape
  * ================================================================ */
-static void json_escape(char *dst, int dstlen, const char *src) {
-    int i, o = 0;
-    unsigned char c;
-    if (!src || !dstlen) { if (dstlen) dst[0] = 0; return; }
-    for (i = 0; src[i] && o < dstlen - 6; i++) {
-        c = (unsigned char)src[i];
-        if (c == '"') {
-            dst[o++] = '\\'; dst[o++] = '"';
-        } else if (c == '\\') {
-            dst[o++] = '\\'; dst[o++] = '\\';
+
+static void json_escape(const char *src, char *dst, int dstsize)
+{
+    int si = 0, di = 0;
+    while (src[si] && di < dstsize - 2) {
+        char c = src[si++];
+        if (c == '"' || c == '\\') {
+            if (di + 2 >= dstsize) break;
+            dst[di++] = '\\';
+            dst[di++] = c;
         } else if (c == '\n') {
-            dst[o++] = '\\'; dst[o++] = 'n';
-        } else if (c == '\r') {
-            dst[o++] = '\\'; dst[o++] = 'r';
+            if (di + 2 >= dstsize) break;
+            dst[di++] = '\\';
+            dst[di++] = 'n';
         } else if (c == '\t') {
-            dst[o++] = '\\'; dst[o++] = 't';
+            if (di + 2 >= dstsize) break;
+            dst[di++] = '\\';
+            dst[di++] = 't';
         } else if (c >= 0x20 && c < 0x7f) {
-            dst[o++] = c;
-        } else if (o + 4 < dstlen) {
-            static const char hex[] = "0123456789abcdef";
-            dst[o++] = '\\';
-            dst[o++] = 'x';
-            dst[o++] = hex[(c >> 4) & 0xf];
-            dst[o++] = hex[c & 0xf];
+            dst[di++] = c;
+        } else {
+            dst[di++] = '.';
         }
     }
-    dst[o] = 0;
+    dst[di] = '\0';
 }
 
 /* ================================================================
- * pt_regs access (ARM64, KPM-safe)
+ * Caller resolution: SO + offset via /proc/<pid>/maps
  * ================================================================ */
-static unsigned long *get_pt_regs(void) {
-    unsigned long sp;
-    __asm__ volatile("mov %0, sp" : "=r"(sp));
-    sp = sp & ~(THREAD_SIZE - 1);
-    return (unsigned long *)(sp + REGS_OFFSET);
-}
 
-/* ================================================================
- * File output (KPM-safe: uses raw_syscall)
- * ================================================================ */
-static int write_output_file(const char *path, const char *buf, int len) {
-    long fd;
-    fd = raw_syscall4(__NR_openat, -100 /* AT_FDCWD */,
-                      (unsigned long)path,
-                      0x241 /* O_WRONLY|O_CREAT|O_TRUNC */,
-                      0644);
-    if (fd < 0) return -1;
-    raw_syscall3(__NR_write, fd, (unsigned long)buf, len);
+static void refresh_maps_for_pid(int pid)
+{
+    char path_buf[64];
+    char line_buf[MAPS_LINE_BUF];
+    int fd, n, pos, line_start, entry_idx;
+    unsigned long long seg_start, seg_end, seg_off;
+    char perms[8];
+
+    if (g_maps_cache.pid == pid && g_maps_cache.count > 0)
+        return; /* already cached */
+
+    g_maps_cache.pid = pid;
+    g_maps_cache.count = 0;
+
+    /* Build path: /proc/<pid>/maps */
+    {
+        int p = 0, tmp, digits, d;
+        const char *prefix = "/proc/";
+        const char *suffix = "/maps";
+        for (d = 0; prefix[d]; d++) path_buf[p++] = prefix[d];
+        /* Convert pid to string */
+        if (pid == 0) { path_buf[p++] = '0'; }
+        else {
+            char num[12]; digits = 0; tmp = pid;
+            while (tmp > 0) { num[digits++] = '0' + (tmp % 10); tmp /= 10; }
+            for (d = digits - 1; d >= 0; d--) path_buf[p++] = num[d];
+        }
+        for (d = 0; suffix[d]; d++) path_buf[p++] = suffix[d];
+        path_buf[p] = '\0';
+    }
+
+    /* Open maps file via raw_syscall */
+    fd = (int)raw_syscall3(__NR_openat, -100 /* AT_FDCWD */, (long)path_buf, 0 /* O_RDONLY */);
+    if (fd < 0) return;
+
+    entry_idx = 0;
+    pos = 0;
+    line_start = 0;
+
+    while (entry_idx < MAPS_CACHE_SIZE) {
+        n = (int)raw_syscall3(__NR_read, fd, (long)(line_buf + pos), MAPS_LINE_BUF - pos - 1);
+        if (n <= 0) break;
+        pos += n;
+        line_buf[pos] = '\0';
+
+        /* Parse complete lines */
+        {
+            int i;
+            for (i = line_start; i < pos; i++) {
+                if (line_buf[i] != '\n') continue;
+                line_buf[i] = '\0';
+
+                /* Parse: start-end perms offset ... pathname */
+                {
+                    const char *lp = &line_buf[line_start];
+                    int ci = 0, fi = 0;
+                    unsigned long long val;
+                    char c;
+
+                    /* Parse start address (hex) */
+                    val = 0;
+                    while ((c = lp[ci]) && c != '-') {
+                        val <<= 4;
+                        if (c >= '0' && c <= '9') val |= (c - '0');
+                        else if (c >= 'a' && c <= 'f') val |= (c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') val |= (c - 'A' + 10);
+                        ci++;
+                    }
+                    seg_start = val;
+                    if (lp[ci] == '-') ci++;
+
+                    /* Parse end address (hex) */
+                    val = 0;
+                    while ((c = lp[ci]) && c != ' ') {
+                        val <<= 4;
+                        if (c >= '0' && c <= '9') val |= (c - '0');
+                        else if (c >= 'a' && c <= 'f') val |= (c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') val |= (c - 'A' + 10);
+                        ci++;
+                    }
+                    seg_end = val;
+                    if (lp[ci] == ' ') ci++;
+
+                    /* Perms (4 chars) */
+                    fi = 0;
+                    while ((c = lp[ci]) && c != ' ' && fi < 7) { perms[fi++] = c; ci++; }
+                    perms[fi] = '\0';
+                    if (lp[ci] == ' ') ci++;
+
+                    /* Parse offset (hex) */
+                    val = 0;
+                    while ((c = lp[ci]) && c != ' ') {
+                        val <<= 4;
+                        if (c >= '0' && c <= '9') val |= (c - '0');
+                        else if (c >= 'a' && c <= 'f') val |= (c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') val |= (c - 'A' + 10);
+                        ci++;
+                    }
+                    seg_off = val;
+                    if (lp[ci] == ' ') ci++;
+
+                    /* Skip dev and inode fields */
+                    while (lp[ci] && lp[ci] != ' ') ci++; /* dev */
+                    if (lp[ci] == ' ') ci++;
+                    while (lp[ci] && lp[ci] != ' ') ci++; /* inode */
+                    while (lp[ci] == ' ') ci++;
+
+                    /* Remaining = pathname */
+                    if (lp[ci] && lp[ci] != '\n' && perms[2] == 'x') {
+                        struct maps_entry *me = &g_maps_cache.entries[entry_idx];
+                        me->vm_start = seg_start;
+                        me->vm_end = seg_end;
+                        me->pgoff = seg_off;
+                        {
+                            int ni = 0;
+                            /* Extract basename */
+                            const char *np = &lp[ci];
+                            const char *last_slash = np;
+                            const char *sp;
+                            for (sp = np; *sp; sp++) {
+                                if (*sp == '/') last_slash = sp + 1;
+                            }
+                            for (sp = last_slash; *sp && ni < MAX_PATH_LEN - 1; sp++)
+                                me->name[ni++] = *sp;
+                            me->name[ni] = '\0';
+                        }
+                        entry_idx++;
+                    }
+                }
+
+                line_start = i + 1;
+            }
+        }
+
+        /* Move remaining partial line to beginning */
+        if (line_start > 0 && line_start < pos) {
+            int rem = pos - line_start;
+            int m;
+            for (m = 0; m < rem; m++) line_buf[m] = line_buf[line_start + m];
+            pos = rem;
+            line_start = 0;
+        } else if (line_start >= pos) {
+            pos = 0;
+            line_start = 0;
+        }
+    }
+
     raw_syscall1(__NR_close, fd);
-    return 0;
+    g_maps_cache.count = entry_idx;
+}
+
+static void resolve_caller(struct svc_event *ev)
+{
+    int i;
+    unsigned long long pc = ev->caller_pc;
+
+    ev->caller_so[0] = '\0';
+    ev->caller_offset = 0;
+
+    if (!pc) return;
+
+    /* Refresh maps cache if needed */
+    refresh_maps_for_pid(ev->pid);
+
+    for (i = 0; i < g_maps_cache.count; i++) {
+        struct maps_entry *me = &g_maps_cache.entries[i];
+        if (pc >= me->vm_start && pc < me->vm_end) {
+            kp_memcpy(ev->caller_so, me->name, MAX_PATH_LEN);
+            ev->caller_offset = pc - me->vm_start + me->pgoff;
+            return;
+        }
+    }
+
+    /* If not found, use raw hex */
+    {
+        const char *hex = "0123456789abcdef";
+        char *p = ev->caller_so;
+        int si;
+        p[0] = '0'; p[1] = 'x';
+        for (si = 0; si < 16; si++)
+            p[2 + si] = hex[(pc >> (60 - si * 4)) & 0xf];
+        p[18] = '\0';
+    }
 }
 
 /* ================================================================
- * Tier1 hook list (44 syscalls, always loaded when enabled)
+ * Capture caller PC/LR from pt_regs (has_syscall_wrapper aware)
  * ================================================================ */
-static const int tier1_nrs[] = {
-    56,57,63,64,35,34,53,54,48,78,79,80,82,83,
-    62,61,67,68,65,66,45,46,47,29,25,23,24,
-    198,200,201,202,203,206,207,208,209,210,211,212,
-    220,221,129,131,222
-};
-#define TIER1_COUNT (sizeof(tier1_nrs)/sizeof(tier1_nrs[0]))
+
+static void capture_caller(struct svc_event *ev, void *fargs_raw)
+{
+    ev->caller_pc = 0;
+    ev->caller_lr = 0;
+
+    if (has_syscall_wrapper) {
+        /* When has_syscall_wrapper=1, arg0 of the hook is pt_regs* */
+        unsigned long long *regs;
+        hook_fargs6_t *fa = (hook_fargs6_t *)fargs_raw;
+        regs = (unsigned long long *)fa->arg0;
+        if (regs) {
+            ev->caller_pc = regs[32]; /* pc in ARM64 pt_regs is at index 32 */
+            ev->caller_lr = regs[30]; /* x30 = LR */
+        }
+    } else {
+        /* Fallback: read SP_EL0 based pt_regs */
+        unsigned long long sp;
+        __asm__ volatile("mrs %0, sp_el0" : "=r"(sp));
+        if (sp) {
+            /* pt_regs at top of kernel stack */
+            unsigned long long *stack_regs = (unsigned long long *)(sp + 0x40);
+            ev->caller_pc = stack_regs[32];
+            ev->caller_lr = stack_regs[30];
+        }
+    }
+
+    /* Strip PAC bits for ARMv8.3+ */
+    ev->caller_pc &= 0x0000FFFFFFFFFFFFULL;
+    ev->caller_lr &= 0x0000FFFFFFFFFFFFULL;
+}
 
 /* ================================================================
- * Tier2 hook list (25 syscalls, loaded on demand)
+ * Event ring buffer
  * ================================================================ */
-static const int tier2_nrs[] = {
-    40,39,76,71,117,167,261,277,
-    105,106,273,280,281,
-    226,233,214,215,216,228,229,
-    5,8,14,88,
-    435
-};
-#define TIER2_COUNT (sizeof(tier2_nrs)/sizeof(tier2_nrs[0]))
+
+static void push_event(struct svc_event *ev)
+{
+    if (g_ev_count >= MAX_EVENTS) {
+        g_ev_dropped++;
+        return;
+    }
+    kp_memcpy(&g_events[g_ev_tail], ev, sizeof(*ev));
+    g_ev_tail = (g_ev_tail + 1) % MAX_EVENTS;
+    g_ev_count++;
+}
+
+static int pop_event(struct svc_event *out)
+{
+    if (g_ev_count <= 0) return 0;
+    kp_memcpy(out, &g_events[g_ev_head], sizeof(*out));
+    g_ev_head = (g_ev_head + 1) % MAX_EVENTS;
+    g_ev_count--;
+    return 1;
+}
+
+static unsigned long long get_timestamp_ns(void)
+{
+    /* Use clock_gettime via raw_syscall */
+    struct { long tv_sec; long tv_nsec; } ts;
+    ts.tv_sec = 0; ts.tv_nsec = 0;
+    raw_syscall2(__NR_clock_gettime, 1 /* CLOCK_MONOTONIC */, (long)&ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+}
 
 /* ================================================================
- * Preset definitions
+ * Deep argument parsing - comprehensive syscall parameter decode
  * ================================================================ */
-struct preset_def {
-    int id;
-    const char *name;
-    const char *desc;
-    const int *nrs;
-    int count;
-};
 
-static const int preset_file_io[] = {56,57,63,64,62,67,68,65,66,82,83,71,45,46,47,61,80,79,213};
-static const int preset_fs_ops[] = {34,35,33,53,54,55,48,78,38,276,37,36,49,88,5,8,14,291};
-static const int preset_network[] = {198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,242,269,243};
-static const int preset_process[] = {220,221,281,435,93,94,260,95,167,261,172,178,174,176};
-static const int preset_signal[] = {129,130,131,134,135,136,137,138,240};
-static const int preset_memory[] = {222,226,215,216,214,228,229,230,231,232,233,284};
-static const int preset_ipc[] = {59,186,187,188,189,190,191,192,193,194,195,196,197,98};
-static const int preset_security[] = {277,280,117,105,106,273,90,91,146,147,149,151,152,268};
+static void deep_parse_args(int nr, unsigned long long *a, char *buf, int bufsize)
+{
+    char tmp[MAX_ARG_STR];
+    char tmp2[MAX_ARG_STR];
+    int pos = 0;
 
-static const struct preset_def presets[] = {
-    {1, "file_io",  "File I/O",      preset_file_io,  sizeof(preset_file_io)/sizeof(int)},
-    {2, "fs_ops",   "Filesystem ops", preset_fs_ops,   sizeof(preset_fs_ops)/sizeof(int)},
-    {3, "network",  "Network",       preset_network,   sizeof(preset_network)/sizeof(int)},
-    {4, "process",  "Process mgmt",  preset_process,   sizeof(preset_process)/sizeof(int)},
-    {5, "signal",   "Signals",       preset_signal,    sizeof(preset_signal)/sizeof(int)},
-    {6, "memory",   "Memory mgmt",   preset_memory,    sizeof(preset_memory)/sizeof(int)},
-    {7, "ipc",      "IPC",           preset_ipc,       sizeof(preset_ipc)/sizeof(int)},
-    {8, "security", "Security",      preset_security,  sizeof(preset_security)/sizeof(int)},
-    {0, 0, 0, 0, 0}
-};
+    buf[0] = '\0';
 
-/* ================================================================
- * Deep argument parsing for syscalls
- * ================================================================ */
-static void deep_parse_args(struct svc_event *ev) {
-    char tmp[MAX_STR_LEN];
-    int off = 0;
-    ev->desc[0] = 0;
-    ev->fd_path[0] = 0;
-    ev->clone_fn = 0;
+#define APPEND(...) do { \
+    int _r = __builtin_snprintf(buf + pos, bufsize - pos, __VA_ARGS__); \
+    if (_r > 0) pos += _r; \
+} while(0)
 
-    switch (ev->nr) {
+#define READ_STR(dst, uaddr) safe_strncpy_user(dst, (unsigned long)(uaddr), sizeof(dst))
+
+    switch (nr) {
+
+    /* === File operations === */
     case __NR_openat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx mode=0%lo", (int)ev->a0, tmp, ev->a2, ev->a3);
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",flags=0x%x,mode=0%o",
+               (int)a[0], tmp2, (unsigned int)a[2], (unsigned int)a[3]);
+        break;
+    case __NR_openat2:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",how=%p,size=%lu",
+               (int)a[0], tmp2, (void*)a[2], (unsigned long)a[3]);
         break;
     case __NR_close:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d", (int)ev->a0);
+        APPEND("fd=%d", (int)a[0]);
+        break;
+    case __NR_close_range:
+        APPEND("fd_lo=%u,fd_hi=%u,flags=0x%x",
+               (unsigned int)a[0], (unsigned int)a[1], (unsigned int)a[2]);
         break;
     case __NR_read:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d count=%lu", (int)ev->a0, ev->a2);
+        APPEND("fd=%d,buf=%p,count=%lu", (int)a[0], (void*)a[1], (unsigned long)a[2]);
         break;
     case __NR_write:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d count=%lu", (int)ev->a0, ev->a2);
-        break;
-    case __NR_readv:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d iovcnt=%lu", (int)ev->a0, ev->a2);
-        break;
-    case __NR_writev:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d iovcnt=%lu", (int)ev->a0, ev->a2);
+        APPEND("fd=%d,buf=%p,count=%lu", (int)a[0], (void*)a[1], (unsigned long)a[2]);
         break;
     case __NR_pread64:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d count=%lu offset=%ld", (int)ev->a0, ev->a2, (long)ev->a3);
+        APPEND("fd=%d,buf=%p,count=%lu,offset=%lld",
+               (int)a[0], (void*)a[1], (unsigned long)a[2], (long long)a[3]);
         break;
     case __NR_pwrite64:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d count=%lu offset=%ld", (int)ev->a0, ev->a2, (long)ev->a3);
+        APPEND("fd=%d,buf=%p,count=%lu,offset=%lld",
+               (int)a[0], (void*)a[1], (unsigned long)a[2], (long long)a[3]);
+        break;
+    case __NR_readv:
+    case __NR_writev:
+        APPEND("fd=%d,iov=%p,iovcnt=%d", (int)a[0], (void*)a[1], (int)a[2]);
         break;
     case __NR_lseek:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d offset=%ld whence=%d", (int)ev->a0, (long)ev->a1, (int)ev->a2);
-        break;
-    case __NR_sendfile:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "out_fd=%d in_fd=%d count=%lu", (int)ev->a0, (int)ev->a1, ev->a3);
-        break;
-    case __NR_getdents64:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d count=%lu", (int)ev->a0, ev->a2);
-        break;
-    case __NR_fstat:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d", (int)ev->a0);
-        break;
-    case __NR_newfstatat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx", (int)ev->a0, tmp, ev->a3);
-        break;
-    case __NR_fsync:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d", (int)ev->a0);
-        break;
-    case __NR_fdatasync:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d", (int)ev->a0);
-        break;
-    case __NR_truncate:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "path=\"%s\" length=%ld", tmp, (long)ev->a1);
-        break;
-    case __NR_ftruncate:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d length=%ld", (int)ev->a0, (long)ev->a1);
-        break;
-    case __NR_fallocate:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d mode=%d offset=%ld len=%ld", (int)ev->a0, (int)ev->a1, (long)ev->a2, (long)ev->a3);
-        break;
-    case __NR_readlinkat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" bufsiz=%lu", (int)ev->a0, tmp, ev->a3);
-        break;
-    case __NR_faccessat:
-    case __NR_faccessat2:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" mode=%d flags=0x%lx", (int)ev->a0, tmp, (int)ev->a2, ev->a3);
-        break;
-    case __NR_mkdirat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" mode=0%lo", (int)ev->a0, tmp, ev->a2);
-        break;
-    case __NR_unlinkat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx", (int)ev->a0, tmp, ev->a2);
-        break;
-    case __NR_renameat:
-    case __NR_renameat2: {
-        char tmp2[MAX_STR_LEN];
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        safe_copy_user_bytes(tmp2, ev->a3, sizeof(tmp2));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "olddfd=%d old=\"%s\" newdfd=%d new=\"%s\"", (int)ev->a0, tmp, (int)ev->a2, tmp2);
-        break;
-    }
-    case __NR_linkat: {
-        char tmp2[MAX_STR_LEN];
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        safe_copy_user_bytes(tmp2, ev->a3, sizeof(tmp2));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "olddfd=%d old=\"%s\" newdfd=%d new=\"%s\" flags=0x%lx", (int)ev->a0, tmp, (int)ev->a2, tmp2, ev->a4);
-        break;
-    }
-    case __NR_symlinkat: {
-        char tmp2[MAX_STR_LEN];
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        safe_copy_user_bytes(tmp2, ev->a2, sizeof(tmp2));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "target=\"%s\" newdfd=%d linkpath=\"%s\"", tmp, (int)ev->a1, tmp2);
-        break;
-    }
-    case __NR_fchmod:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d mode=0%lo", (int)ev->a0, ev->a1);
-        break;
-    case __NR_fchmodat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" mode=0%lo", (int)ev->a0, tmp, ev->a2);
-        break;
-    case __NR_fchownat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" uid=%d gid=%d flags=0x%lx", (int)ev->a0, tmp, (int)ev->a2, (int)ev->a3, ev->a4);
-        break;
-    case __NR_fchown:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d uid=%d gid=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
-        break;
-    case __NR_ioctl:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d cmd=0x%lx arg=0x%lx", (int)ev->a0, ev->a1, ev->a2);
-        break;
-    case __NR_fcntl:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d cmd=%d arg=0x%lx", (int)ev->a0, (int)ev->a1, ev->a2);
+        APPEND("fd=%d,offset=%lld,whence=%d", (int)a[0], (long long)a[1], (int)a[2]);
         break;
     case __NR_dup:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "oldfd=%d", (int)ev->a0);
+        APPEND("oldfd=%d", (int)a[0]);
         break;
     case __NR_dup3:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "oldfd=%d newfd=%d flags=0x%lx", (int)ev->a0, (int)ev->a1, ev->a2);
+        APPEND("oldfd=%d,newfd=%d,flags=0x%x", (int)a[0], (int)a[1], (unsigned int)a[2]);
         break;
-    case __NR_splice:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd_in=%d fd_out=%d len=%lu flags=0x%lx", (int)ev->a0, (int)ev->a2, ev->a4, ev->a5);
+    case __NR_fcntl:
+        APPEND("fd=%d,cmd=%d,arg=0x%lx", (int)a[0], (int)a[1], (unsigned long)a[2]);
         break;
-    case __NR_readahead:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d offset=%ld count=%lu", (int)ev->a0, (long)ev->a1, ev->a2);
+    case __NR_ioctl:
+        APPEND("fd=%d,cmd=0x%lx,arg=0x%lx", (int)a[0], (unsigned long)a[1], (unsigned long)a[2]);
         break;
-    /* --- Network --- */
-    case __NR_socket:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "domain=%d type=%d protocol=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_fstat:
+        APPEND("fd=%d,statbuf=%p", (int)a[0], (void*)a[1]);
         break;
-    case __NR_bind:
-    case __NR_connect:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d addrlen=%d", (int)ev->a0, (int)ev->a2);
+    case __NR_fstatat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",statbuf=%p,flags=0x%x",
+               (int)a[0], tmp2, (void*)a[2], (unsigned int)a[3]);
         break;
-    case __NR_listen:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d backlog=%d", (int)ev->a0, (int)ev->a1);
+    case __NR_statx:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",flags=0x%x,mask=0x%x,statxbuf=%p",
+               (int)a[0], tmp2, (unsigned int)a[2], (unsigned int)a[3], (void*)a[4]);
         break;
-    case __NR_accept:
-    case __NR_accept4:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d flags=0x%lx", (int)ev->a0, ev->a3);
+    case __NR_statfs:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("path=\"%s\",buf=%p", tmp2, (void*)a[1]);
         break;
-    case __NR_sendto:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d len=%lu flags=0x%lx", (int)ev->a0, ev->a2, ev->a3);
+    case __NR_fstatfs:
+        APPEND("fd=%d,buf=%p", (int)a[0], (void*)a[1]);
         break;
-    case __NR_recvfrom:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d len=%lu flags=0x%lx", (int)ev->a0, ev->a2, ev->a3);
+    case __NR_getcwd:
+        APPEND("buf=%p,size=%lu", (void*)a[0], (unsigned long)a[1]);
         break;
-    case __NR_setsockopt:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d level=%d optname=%d optlen=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2, (int)ev->a4);
+    case __NR_getdents64:
+        APPEND("fd=%d,dirent=%p,count=%u", (int)a[0], (void*)a[1], (unsigned int)a[2]);
         break;
-    case __NR_getsockopt:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d level=%d optname=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_sendfile:
+        APPEND("out_fd=%d,in_fd=%d,offset=%p,count=%lu",
+               (int)a[0], (int)a[1], (void*)a[2], (unsigned long)a[3]);
         break;
-    case __NR_shutdown:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d how=%d", (int)ev->a0, (int)ev->a1);
+    case __NR_copy_file_range:
+        APPEND("fd_in=%d,off_in=%p,fd_out=%d,off_out=%p,len=%lu,flags=0x%x",
+               (int)a[0], (void*)a[1], (int)a[2], (void*)a[3], (unsigned long)a[4], (unsigned int)a[5]);
         break;
-    case __NR_sendmsg:
-    case __NR_recvmsg:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d flags=0x%lx", (int)ev->a0, ev->a2);
+
+    /* === Path operations === */
+    case __NR_faccessat:
+    case __NR_faccessat2:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",mode=0%o,flags=0x%x",
+               (int)a[0], tmp2, (unsigned int)a[2], (unsigned int)a[3]);
         break;
-    case __NR_sendmmsg:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d vlen=%u flags=0x%lx", (int)ev->a0, (unsigned)ev->a2, ev->a3);
+    case __NR_mkdirat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",mode=0%o", (int)a[0], tmp2, (unsigned int)a[2]);
         break;
-    case __NR_recvmmsg:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d vlen=%u flags=0x%lx", (int)ev->a0, (unsigned)ev->a2, ev->a3);
+    case __NR_mknodat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",mode=0%o,dev=0x%lx",
+               (int)a[0], tmp2, (unsigned int)a[2], (unsigned long)a[3]);
         break;
-    case __NR_socketpair:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "domain=%d type=%d protocol=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_unlinkat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",flags=0x%x", (int)a[0], tmp2, (unsigned int)a[2]);
         break;
-    /* --- Process --- */
+    case __NR_renameat:
+    case __NR_renameat2:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char old_esc[MAX_ARG_STR];
+            kp_memcpy(old_esc, tmp2, sizeof(old_esc));
+            READ_STR(tmp, a[3]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("olddirfd=%d,oldpath=\"%s\",newdirfd=%d,newpath=\"%s\"",
+                   (int)a[0], old_esc, (int)a[2], tmp2);
+        }
+        break;
+    case __NR_symlinkat:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char target_esc[MAX_ARG_STR];
+            kp_memcpy(target_esc, tmp2, sizeof(target_esc));
+            READ_STR(tmp, a[2]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("target=\"%s\",newdirfd=%d,linkpath=\"%s\"",
+                   target_esc, (int)a[1], tmp2);
+        }
+        break;
+    case __NR_linkat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char old_esc[MAX_ARG_STR];
+            kp_memcpy(old_esc, tmp2, sizeof(old_esc));
+            READ_STR(tmp, a[3]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("olddirfd=%d,oldpath=\"%s\",newdirfd=%d,newpath=\"%s\",flags=0x%x",
+                   (int)a[0], old_esc, (int)a[2], tmp2, (unsigned int)a[4]);
+        }
+        break;
+    case __NR_readlinkat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",buf=%p,bufsiz=%lu",
+               (int)a[0], tmp2, (void*)a[2], (unsigned long)a[3]);
+        break;
+    case __NR_chdir:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("path=\"%s\"", tmp2);
+        break;
+    case __NR_chroot:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("path=\"%s\"", tmp2);
+        break;
+    case __NR_fchdir:
+        APPEND("fd=%d", (int)a[0]);
+        break;
+    case __NR_fchmod:
+        APPEND("fd=%d,mode=0%o", (int)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_fchmodat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",mode=0%o", (int)a[0], tmp2, (unsigned int)a[2]);
+        break;
+    case __NR_fchownat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",uid=%d,gid=%d,flags=0x%x",
+               (int)a[0], tmp2, (int)a[2], (int)a[3], (unsigned int)a[4]);
+        break;
+    case __NR_fchown:
+        APPEND("fd=%d,uid=%d,gid=%d", (int)a[0], (int)a[1], (int)a[2]);
+        break;
+    case __NR_truncate:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("path=\"%s\",length=%lld", tmp2, (long long)a[1]);
+        break;
+    case __NR_ftruncate:
+        APPEND("fd=%d,length=%lld", (int)a[0], (long long)a[1]);
+        break;
+    case __NR_fallocate:
+        APPEND("fd=%d,mode=%d,offset=%lld,len=%lld",
+               (int)a[0], (int)a[1], (long long)a[2], (long long)a[3]);
+        break;
+    case __NR_utimensat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",times=%p,flags=0x%x",
+               (int)a[0], tmp2, (void*)a[2], (unsigned int)a[3]);
+        break;
+
+    /* === Process operations === */
+    case __NR_execve:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("filename=\"%s\",argv=%p,envp=%p", tmp2, (void*)a[1], (void*)a[2]);
+        break;
+    case __NR_execveat:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("dirfd=%d,path=\"%s\",argv=%p,envp=%p,flags=0x%x",
+               (int)a[0], tmp2, (void*)a[2], (void*)a[3], (unsigned int)a[4]);
+        break;
     case __NR_clone:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "flags=0x%lx stack=0x%lx", ev->a0, ev->a1);
+        APPEND("flags=0x%lx,stack=%p,parent_tid=%p,tls=%p,child_tid=%p",
+               (unsigned long)a[0], (void*)a[1], (void*)a[2], (void*)a[3], (void*)a[4]);
         break;
     case __NR_clone3:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "args=0x%lx size=%lu", ev->a0, ev->a1);
-        break;
-    case __NR_execve: {
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "filename=\"%s\"", tmp);
-        break;
-    }
-    case __NR_execveat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx", (int)ev->a0, tmp, ev->a4);
+        APPEND("clone_args=%p,size=%lu", (void*)a[0], (unsigned long)a[1]);
         break;
     case __NR_exit:
     case __NR_exit_group:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "status=%d", (int)ev->a0);
+        APPEND("status=%d", (int)a[0]);
         break;
     case __NR_wait4:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "pid=%d options=0x%lx", (int)ev->a0, ev->a2);
+        APPEND("pid=%d,wstatus=%p,options=0x%x,rusage=%p",
+               (int)a[0], (void*)a[1], (unsigned int)a[2], (void*)a[3]);
         break;
     case __NR_waitid:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "which=%d pid=%d options=0x%lx", (int)ev->a0, (int)ev->a1, ev->a3);
+        APPEND("which=%d,pid=%d,infop=%p,options=0x%x,rusage=%p",
+               (int)a[0], (int)a[1], (void*)a[2], (unsigned int)a[3], (void*)a[4]);
+        break;
+    case __NR_getpid:
+    case __NR_getppid:
+    case __NR_gettid:
+    case __NR_getuid:
+    case __NR_geteuid:
+    case __NR_getgid:
+    case __NR_getegid:
+    case __NR_setsid:
+    case __NR_sched_yield:
+    case __NR_sync:
+    case __NR_vhangup:
+        APPEND("(no args)");
+        break;
+    case __NR_setuid:
+        APPEND("uid=%d", (int)a[0]);
+        break;
+    case __NR_setresuid:
+        APPEND("ruid=%d,euid=%d,suid=%d", (int)a[0], (int)a[1], (int)a[2]);
+        break;
+    case __NR_setpgid:
+        APPEND("pid=%d,pgid=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_getpgid:
+        APPEND("pid=%d", (int)a[0]);
         break;
     case __NR_prctl:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "option=%d arg2=0x%lx arg3=0x%lx", (int)ev->a0, ev->a1, ev->a2);
+        APPEND("option=%d,arg2=0x%lx,arg3=0x%lx,arg4=0x%lx,arg5=0x%lx",
+               (int)a[0], (unsigned long)a[1], (unsigned long)a[2],
+               (unsigned long)a[3], (unsigned long)a[4]);
+        break;
+    case __NR_ptrace:
+        APPEND("request=%ld,pid=%d,addr=0x%lx,data=0x%lx",
+               (long)a[0], (int)a[1], (unsigned long)a[2], (unsigned long)a[3]);
+        break;
+    case __NR_set_tid_address:
+        APPEND("tidptr=%p", (void*)a[0]);
+        break;
+    case __NR_unshare:
+        APPEND("flags=0x%lx", (unsigned long)a[0]);
         break;
     case __NR_prlimit64:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "pid=%d resource=%d", (int)ev->a0, (int)ev->a1);
+        APPEND("pid=%d,resource=%d,new_rlim=%p,old_rlim=%p",
+               (int)a[0], (int)a[1], (void*)a[2], (void*)a[3]);
         break;
-    /* --- Signal --- */
-    case __NR_kill:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "pid=%d sig=%d", (int)ev->a0, (int)ev->a1);
+    case __NR_getrlimit:
+        APPEND("resource=%d,rlim=%p", (int)a[0], (void*)a[1]);
         break;
-    case __NR_tkill:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "tid=%d sig=%d", (int)ev->a0, (int)ev->a1);
+    case __NR_setrlimit:
+        APPEND("resource=%d,rlim=%p", (int)a[0], (void*)a[1]);
         break;
-    case __NR_tgkill:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "tgid=%d tid=%d sig=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_personality:
+        APPEND("persona=0x%lx", (unsigned long)a[0]);
         break;
-    case __NR_rt_sigaction:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "sig=%d", (int)ev->a0);
+    case __NR_process_vm_readv:
+    case __NR_process_vm_writev:
+        APPEND("pid=%d,lvec=%p,liovcnt=%lu,rvec=%p,riovcnt=%lu,flags=0x%lx",
+               (int)a[0], (void*)a[1], (unsigned long)a[2],
+               (void*)a[3], (unsigned long)a[4], (unsigned long)a[5]);
         break;
-    case __NR_rt_sigprocmask:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "how=%d", (int)ev->a0);
+    case __NR_kcmp:
+        APPEND("pid1=%d,pid2=%d,type=%d,idx1=%lu,idx2=%lu",
+               (int)a[0], (int)a[1], (int)a[2], (unsigned long)a[3], (unsigned long)a[4]);
         break;
-    /* --- Memory --- */
+    case __NR_pidfd_open:
+        APPEND("pid=%d,flags=0x%x", (int)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_pidfd_getfd:
+        APPEND("pidfd=%d,targetfd=%d,flags=0x%x", (int)a[0], (int)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_pidfd_send_signal:
+        APPEND("pidfd=%d,sig=%d,info=%p,flags=0x%x",
+               (int)a[0], (int)a[1], (void*)a[2], (unsigned int)a[3]);
+        break;
+
+    /* === Memory operations === */
     case __NR_mmap:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu prot=0x%lx flags=0x%lx fd=%d offset=%ld",
-            ev->a0, ev->a1, ev->a2, ev->a3, (int)ev->a4, (long)ev->a5);
-        break;
-    case __NR_mprotect:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu prot=0x%lx", ev->a0, ev->a1, ev->a2);
+        APPEND("addr=%p,length=0x%lx,prot=0x%x,flags=0x%x,fd=%d,offset=0x%lx",
+               (void*)a[0], (unsigned long)a[1], (unsigned int)a[2],
+               (unsigned int)a[3], (int)a[4], (unsigned long)a[5]);
         break;
     case __NR_munmap:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu", ev->a0, ev->a1);
+        APPEND("addr=%p,length=0x%lx", (void*)a[0], (unsigned long)a[1]);
+        break;
+    case __NR_mprotect:
+    case __NR_pkey_mprotect:
+        APPEND("addr=%p,len=0x%lx,prot=0x%x",
+               (void*)a[0], (unsigned long)a[1], (unsigned int)a[2]);
         break;
     case __NR_mremap:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "old_addr=0x%lx old_len=%lu new_len=%lu flags=0x%lx", ev->a0, ev->a1, ev->a2, ev->a3);
+        APPEND("old_addr=%p,old_size=0x%lx,new_size=0x%lx,flags=0x%x,new_addr=%p",
+               (void*)a[0], (unsigned long)a[1], (unsigned long)a[2],
+               (unsigned int)a[3], (void*)a[4]);
         break;
     case __NR_brk:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx", ev->a0);
+        APPEND("brk=%p", (void*)a[0]);
+        break;
+    case __NR_madvise:
+        APPEND("addr=%p,length=0x%lx,advice=%d",
+               (void*)a[0], (unsigned long)a[1], (int)a[2]);
         break;
     case __NR_mlock:
     case __NR_mlock2:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu", ev->a0, ev->a1);
+        APPEND("addr=%p,len=0x%lx", (void*)a[0], (unsigned long)a[1]);
         break;
     case __NR_munlock:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu", ev->a0, ev->a1);
+        APPEND("addr=%p,len=0x%lx", (void*)a[0], (unsigned long)a[1]);
         break;
-    case __NR_madvise:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "addr=0x%lx len=%lu advice=%d", ev->a0, ev->a1, (int)ev->a2);
+    case __NR_msync:
+        APPEND("addr=%p,length=0x%lx,flags=0x%x",
+               (void*)a[0], (unsigned long)a[1], (unsigned int)a[2]);
         break;
-    /* --- Tier2: mount/security/etc --- */
-    case __NR_mount: {
-        char dev[MAX_STR_LEN], tgt[MAX_STR_LEN], fs[64];
-        safe_copy_user_bytes(dev, ev->a0, sizeof(dev));
-        safe_copy_user_bytes(tgt, ev->a1, sizeof(tgt));
-        safe_copy_user_bytes(fs, ev->a2, sizeof(fs));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dev=\"%s\" target=\"%s\" fs=\"%s\" flags=0x%lx", dev, tgt, fs, ev->a3);
+    case __NR_memfd_create:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("name=\"%s\",flags=0x%x", tmp2, (unsigned int)a[1]);
         break;
-    }
+    case __NR_getrandom:
+        APPEND("buf=%p,count=%lu,flags=0x%x",
+               (void*)a[0], (unsigned long)a[1], (unsigned int)a[2]);
+        break;
+
+    /* === Signal operations === */
+    case __NR_kill:
+        APPEND("pid=%d,sig=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_tkill:
+        APPEND("tid=%d,sig=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_tgkill:
+        APPEND("tgid=%d,tid=%d,sig=%d", (int)a[0], (int)a[1], (int)a[2]);
+        break;
+    case __NR_rt_sigaction:
+        APPEND("signum=%d,act=%p,oldact=%p,sigsetsize=%lu",
+               (int)a[0], (void*)a[1], (void*)a[2], (unsigned long)a[3]);
+        break;
+    case __NR_rt_sigprocmask:
+        APPEND("how=%d,set=%p,oldset=%p,sigsetsize=%lu",
+               (int)a[0], (void*)a[1], (void*)a[2], (unsigned long)a[3]);
+        break;
+    case __NR_sigaltstack:
+        APPEND("ss=%p,old_ss=%p", (void*)a[0], (void*)a[1]);
+        break;
+    case __NR_rt_tgsigqueueinfo:
+        APPEND("tgid=%d,tid=%d,sig=%d,info=%p",
+               (int)a[0], (int)a[1], (int)a[2], (void*)a[3]);
+        break;
+
+    /* === Network operations === */
+    case __NR_socket:
+        APPEND("domain=%d,type=%d,protocol=%d", (int)a[0], (int)a[1], (int)a[2]);
+        break;
+    case __NR_socketpair:
+        APPEND("domain=%d,type=%d,protocol=%d,sv=%p",
+               (int)a[0], (int)a[1], (int)a[2], (void*)a[3]);
+        break;
+    case __NR_bind:
+        APPEND("sockfd=%d,addr=%p,addrlen=%u",
+               (int)a[0], (void*)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_listen:
+        APPEND("sockfd=%d,backlog=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_accept:
+    case __NR_accept4:
+        APPEND("sockfd=%d,addr=%p,addrlen=%p,flags=0x%x",
+               (int)a[0], (void*)a[1], (void*)a[2], (unsigned int)a[3]);
+        break;
+    case __NR_connect:
+        APPEND("sockfd=%d,addr=%p,addrlen=%u",
+               (int)a[0], (void*)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_getsockname:
+    case __NR_getpeername:
+        APPEND("sockfd=%d,addr=%p,addrlen=%p",
+               (int)a[0], (void*)a[1], (void*)a[2]);
+        break;
+    case __NR_sendto:
+        APPEND("sockfd=%d,buf=%p,len=%lu,flags=0x%x,dest_addr=%p,addrlen=%u",
+               (int)a[0], (void*)a[1], (unsigned long)a[2],
+               (unsigned int)a[3], (void*)a[4], (unsigned int)a[5]);
+        break;
+    case __NR_recvfrom:
+        APPEND("sockfd=%d,buf=%p,len=%lu,flags=0x%x,src_addr=%p,addrlen=%p",
+               (int)a[0], (void*)a[1], (unsigned long)a[2],
+               (unsigned int)a[3], (void*)a[4], (void*)a[5]);
+        break;
+    case __NR_sendmsg:
+    case __NR_recvmsg:
+        APPEND("sockfd=%d,msg=%p,flags=0x%x",
+               (int)a[0], (void*)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_setsockopt:
+        APPEND("sockfd=%d,level=%d,optname=%d,optval=%p,optlen=%u",
+               (int)a[0], (int)a[1], (int)a[2], (void*)a[3], (unsigned int)a[4]);
+        break;
+    case __NR_getsockopt:
+        APPEND("sockfd=%d,level=%d,optname=%d,optval=%p,optlen=%p",
+               (int)a[0], (int)a[1], (int)a[2], (void*)a[3], (void*)a[4]);
+        break;
+    case __NR_shutdown:
+        APPEND("sockfd=%d,how=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_sendmmsg:
+        APPEND("sockfd=%d,msgvec=%p,vlen=%u,flags=0x%x",
+               (int)a[0], (void*)a[1], (unsigned int)a[2], (unsigned int)a[3]);
+        break;
+    case __NR_recvmmsg:
+        APPEND("sockfd=%d,msgvec=%p,vlen=%u,flags=0x%x,timeout=%p",
+               (int)a[0], (void*)a[1], (unsigned int)a[2],
+               (unsigned int)a[3], (void*)a[4]);
+        break;
+
+    /* === Mount / FS === */
+    case __NR_mount:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char src_esc[MAX_ARG_STR];
+            kp_memcpy(src_esc, tmp2, sizeof(src_esc));
+            READ_STR(tmp, a[1]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("source=\"%s\",target=\"%s\",fstype=%p,flags=0x%lx,data=%p",
+                   src_esc, tmp2, (void*)a[2], (unsigned long)a[3], (void*)a[4]);
+        }
+        break;
     case __NR_umount2:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "target=\"%s\" flags=0x%lx", tmp, ev->a1);
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("target=\"%s\",flags=0x%x", tmp2, (unsigned int)a[1]);
         break;
-    case __NR_ptrace:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "request=%d pid=%d addr=0x%lx", (int)ev->a0, (int)ev->a1, ev->a2);
-        break;
-    case __NR_seccomp:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "op=%d flags=0x%lx", (int)ev->a0, ev->a1);
-        break;
-    case __NR_init_module:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "len=%lu", ev->a1);
-        break;
-    case __NR_finit_module:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d flags=0x%lx", (int)ev->a0, ev->a2);
-        break;
-    case __NR_delete_module:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "name=\"%s\" flags=0x%lx", tmp, ev->a1);
-        break;
-    case __NR_bpf:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "cmd=%d attr=0x%lx size=%u", (int)ev->a0, ev->a1, (unsigned)ev->a2);
-        break;
-    case __NR_setxattr:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "path=\"%s\" size=%lu flags=0x%lx", tmp, ev->a3, ev->a4);
-        break;
-    case __NR_getxattr:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "path=\"%s\" size=%lu", tmp, ev->a3);
-        break;
-    case __NR_removexattr:
-        safe_copy_user_bytes(tmp, ev->a0, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "path=\"%s\"", tmp);
-        break;
-    case __NR_utimensat:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx", (int)ev->a0, tmp, ev->a3);
+    case __NR_pivot_root:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char new_esc[MAX_ARG_STR];
+            kp_memcpy(new_esc, tmp2, sizeof(new_esc));
+            READ_STR(tmp, a[1]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("new_root=\"%s\",put_old=\"%s\"", new_esc, tmp2);
+        }
         break;
     case __NR_setns:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d nstype=0x%lx", (int)ev->a0, ev->a1);
+        APPEND("fd=%d,nstype=0x%x", (int)a[0], (unsigned int)a[1]);
         break;
-    /* --- IPC --- */
-    case __NR_pipe2:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "flags=0x%lx", ev->a1);
+    case __NR_syncfs:
+        APPEND("fd=%d", (int)a[0]);
         break;
-    case __NR_futex:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "uaddr=0x%lx op=%d val=%d", ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_fsync:
+    case __NR_fdatasync:
+        APPEND("fd=%d", (int)a[0]);
         break;
-    case __NR_epoll_ctl:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "epfd=%d op=%d fd=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+
+    /* === Module / Security === */
+    case __NR_init_module:
+        APPEND("module_image=%p,len=%lu,params=%p",
+               (void*)a[0], (unsigned long)a[1], (void*)a[2]);
         break;
-    case __NR_epoll_pwait:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "epfd=%d maxevents=%d timeout=%d", (int)ev->a0, (int)ev->a2, (int)ev->a3);
+    case __NR_finit_module:
+        APPEND("fd=%d,params=%p,flags=0x%x", (int)a[0], (void*)a[1], (unsigned int)a[2]);
         break;
-    case __NR_statx:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\" flags=0x%lx mask=0x%lx", (int)ev->a0, tmp, ev->a2, ev->a3);
+    case __NR_delete_module:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("name=\"%s\",flags=0x%x", tmp2, (unsigned int)a[1]);
         break;
-    case __NR_openat2:
-        safe_copy_user_bytes(tmp, ev->a1, sizeof(tmp));
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "dfd=%d path=\"%s\"", (int)ev->a0, tmp);
+    case __NR_seccomp:
+        APPEND("op=%u,flags=0x%x,args=%p", (unsigned int)a[0], (unsigned int)a[1], (void*)a[2]);
         break;
-    case __NR_io_uring_setup:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "entries=%u", (unsigned)ev->a0);
+    case __NR_bpf:
+        APPEND("cmd=%d,attr=%p,size=%u", (int)a[0], (void*)a[1], (unsigned int)a[2]);
         break;
-    case __NR_io_uring_enter:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "fd=%d to_submit=%u min_complete=%u flags=0x%lx", (int)ev->a0, (unsigned)ev->a1, (unsigned)ev->a2, ev->a3);
-        break;
-    case __NR_setuid:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "uid=%d", (int)ev->a0);
-        break;
-    case __NR_setresuid:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "ruid=%d euid=%d suid=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
-        break;
-    case __NR_setresgid:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "rgid=%d egid=%d sgid=%d", (int)ev->a0, (int)ev->a1, (int)ev->a2);
+    case __NR_perf_event_open:
+        APPEND("attr=%p,pid=%d,cpu=%d,group_fd=%d,flags=0x%lx",
+               (void*)a[0], (int)a[1], (int)a[2], (int)a[3], (unsigned long)a[4]);
         break;
     case __NR_capget:
+        APPEND("hdrp=%p,datap=%p", (void*)a[0], (void*)a[1]);
+        break;
     case __NR_capset:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "header=0x%lx data=0x%lx", ev->a0, ev->a1);
+        APPEND("hdrp=%p,datap=%p", (void*)a[0], (void*)a[1]);
         break;
+    case __NR_setpriority:
+        APPEND("which=%d,who=%d,prio=%d", (int)a[0], (int)a[1], (int)a[2]);
+        break;
+    case __NR_getpriority:
+        APPEND("which=%d,who=%d", (int)a[0], (int)a[1]);
+        break;
+
+    /* === IPC === */
+    case __NR_futex:
+        APPEND("uaddr=%p,op=%d,val=%d,timeout=%p,uaddr2=%p,val3=%d",
+               (void*)a[0], (int)a[1], (int)a[2], (void*)a[3], (void*)a[4], (int)a[5]);
+        break;
+    case __NR_pipe2:
+        APPEND("pipefd=%p,flags=0x%x", (void*)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_epoll_create1:
+        APPEND("flags=0x%x", (unsigned int)a[0]);
+        break;
+    case __NR_epoll_ctl:
+        APPEND("epfd=%d,op=%d,fd=%d,event=%p",
+               (int)a[0], (int)a[1], (int)a[2], (void*)a[3]);
+        break;
+    case __NR_epoll_pwait:
+        APPEND("epfd=%d,events=%p,maxevents=%d,timeout=%d,sigmask=%p",
+               (int)a[0], (void*)a[1], (int)a[2], (int)a[3], (void*)a[4]);
+        break;
+    case __NR_eventfd2:
+        APPEND("initval=%u,flags=0x%x", (unsigned int)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_inotify_init1:
+        APPEND("flags=0x%x", (unsigned int)a[0]);
+        break;
+    case __NR_inotify_add_watch:
+        READ_STR(tmp, a[1]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("fd=%d,pathname=\"%s\",mask=0x%x",
+               (int)a[0], tmp2, (unsigned int)a[2]);
+        break;
+    case __NR_inotify_rm_watch:
+        APPEND("fd=%d,wd=%d", (int)a[0], (int)a[1]);
+        break;
+    case __NR_shmget:
+        APPEND("key=%d,size=%lu,shmflg=0x%x",
+               (int)a[0], (unsigned long)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_shmat:
+        APPEND("shmid=%d,shmaddr=%p,shmflg=0x%x",
+               (int)a[0], (void*)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_shmdt:
+        APPEND("shmaddr=%p", (void*)a[0]);
+        break;
+    case __NR_shmctl:
+        APPEND("shmid=%d,cmd=%d,buf=%p", (int)a[0], (int)a[1], (void*)a[2]);
+        break;
+    case __NR_semget:
+        APPEND("key=%d,nsems=%d,semflg=0x%x", (int)a[0], (int)a[1], (unsigned int)a[2]);
+        break;
+    case __NR_msgget:
+        APPEND("key=%d,msgflg=0x%x", (int)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_msgsnd:
+        APPEND("msqid=%d,msgp=%p,msgsz=%lu,msgflg=0x%x",
+               (int)a[0], (void*)a[1], (unsigned long)a[2], (unsigned int)a[3]);
+        break;
+    case __NR_msgrcv:
+        APPEND("msqid=%d,msgp=%p,msgsz=%lu,msgtyp=%ld,msgflg=0x%x",
+               (int)a[0], (void*)a[1], (unsigned long)a[2],
+               (long)a[3], (unsigned int)a[4]);
+        break;
+
+    /* === Timer / Clock === */
+    case __NR_nanosleep:
+    case __NR_clock_nanosleep:
+        APPEND("req=%p,rem=%p", (void*)a[0], (void*)a[1]);
+        break;
+    case __NR_clock_gettime:
+        APPEND("clk_id=%d,tp=%p", (int)a[0], (void*)a[1]);
+        break;
+    case __NR_gettimeofday:
+        APPEND("tv=%p,tz=%p", (void*)a[0], (void*)a[1]);
+        break;
+    case __NR_timerfd_create:
+        APPEND("clockid=%d,flags=0x%x", (int)a[0], (unsigned int)a[1]);
+        break;
+    case __NR_setitimer:
+        APPEND("which=%d,new_value=%p,old_value=%p",
+               (int)a[0], (void*)a[1], (void*)a[2]);
+        break;
+
+    /* === Extended attributes === */
+    case __NR_setxattr:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char path_esc[MAX_ARG_STR];
+            kp_memcpy(path_esc, tmp2, sizeof(path_esc));
+            READ_STR(tmp, a[1]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("path=\"%s\",name=\"%s\",value=%p,size=%lu,flags=0x%x",
+                   path_esc, tmp2, (void*)a[2], (unsigned long)a[3], (unsigned int)a[4]);
+        }
+        break;
+    case __NR_getxattr:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        {
+            char path_esc[MAX_ARG_STR];
+            kp_memcpy(path_esc, tmp2, sizeof(path_esc));
+            READ_STR(tmp, a[1]);
+            json_escape(tmp, tmp2, sizeof(tmp2));
+            APPEND("path=\"%s\",name=\"%s\",value=%p,size=%lu",
+                   path_esc, tmp2, (void*)a[2], (unsigned long)a[3]);
+        }
+        break;
+
+    /* === io_uring === */
+    case __NR_io_uring_setup:
+        APPEND("entries=%u,params=%p", (unsigned int)a[0], (void*)a[1]);
+        break;
+    case __NR_io_uring_enter:
+        APPEND("fd=%d,to_submit=%u,min_complete=%u,flags=0x%x,sig=%p,sigsz=%lu",
+               (int)a[0], (unsigned int)a[1], (unsigned int)a[2],
+               (unsigned int)a[3], (void*)a[4], (unsigned long)a[5]);
+        break;
+    case __NR_io_uring_register:
+        APPEND("fd=%d,opcode=%u,arg=%p,nr_args=%u",
+               (int)a[0], (unsigned int)a[1], (void*)a[2], (unsigned int)a[3]);
+        break;
+
+    /* === Misc === */
+    case __NR_uname:
+        APPEND("buf=%p", (void*)a[0]);
+        break;
+    case __NR_sysinfo:
+        APPEND("info=%p", (void*)a[0]);
+        break;
+    case __NR_umask:
+        APPEND("mask=0%o", (unsigned int)a[0]);
+        break;
+    case __NR_getcpu:
+        APPEND("cpu=%p,node=%p", (void*)a[0], (void*)a[1]);
+        break;
+    case __NR_syslog:
+        APPEND("type=%d,buf=%p,len=%d", (int)a[0], (void*)a[1], (int)a[2]);
+        break;
+    case __NR_reboot:
+        APPEND("magic1=0x%x,magic2=0x%x,cmd=0x%x,arg=%p",
+               (unsigned int)a[0], (unsigned int)a[1], (unsigned int)a[2], (void*)a[3]);
+        break;
+    case __NR_acct:
+        READ_STR(tmp, a[0]);
+        json_escape(tmp, tmp2, sizeof(tmp2));
+        APPEND("name=\"%s\"", tmp2);
+        break;
+
     default:
-        off += snprintf(ev->desc + off, MAX_DESC_LEN - off, "a0=0x%lx a1=0x%lx a2=0x%lx", ev->a0, ev->a1, ev->a2);
+        APPEND("a0=0x%llx,a1=0x%llx,a2=0x%llx,a3=0x%llx,a4=0x%llx,a5=0x%llx",
+               a[0], a[1], a[2], a[3], a[4], a[5]);
         break;
     }
-    /* Tier2: caller address capture */
-    if (g_tier2_enabled && ev->caller_addr) {
-        /* caller already set in hook */
-    }
-    (void)off;
+
+#undef APPEND
+#undef READ_STR
 }
 
 /* ================================================================
- * Unified syscall hook callback
- * All 69 hooks (44 tier1 + 25 tier2) funnel into this function.
+ * Syscall hook callback - v9 fix: use syscall_args() for correct arg extraction
  * ================================================================ */
-static void before_syscall(int nr, unsigned long a0, unsigned long a1,
-                           unsigned long a2, unsigned long a3,
-                           unsigned long a4, unsigned long a5)
+
+static void before_syscall_from_hook(void *fargs_raw, int nr)
 {
-    int pid, uid, idx;
-    struct svc_event *ev;
-    unsigned long *regs;
+    struct svc_event ev;
+    uint64_t *real_args;
+    int pid, tid;
+    unsigned int uid;
 
-    if (!g_enabled) return;
-    if (!bitmap_test(nr)) return;
+    if (!g_running) return;
 
-    uid = get_current_uid();
-    if (g_uid_filter >= 0 && uid != g_uid_filter) return;
+    /* Re-entrancy guard */
+    if (g_in_hook) return;
+    g_in_hook = 1;
 
+    /* Get process info */
     pid = get_current_pid();
+    tid = get_current_tid();
+    uid = get_current_uid();
 
-    idx = g_head;
-    g_head = (g_head + 1) % MAX_EVENTS;
-    if (g_count >= MAX_EVENTS)
-        g_tail = (g_tail + 1) % MAX_EVENTS;
-    else
-        g_count++;
-    g_total++;
+    /* Filter check */
+    if (g_target_pid && pid != g_target_pid) { g_in_hook = 0; return; }
+    if (g_target_uid && uid != g_target_uid) { g_in_hook = 0; return; }
 
-    ev = &g_events[idx];
-    ev->seq = g_seq++;
-    ev->nr = nr;
-    ev->pid = pid;
-    ev->uid = uid;
-    get_current_comm(ev->comm, TASK_COMM_LEN);
-    ev->a0 = a0; ev->a1 = a1; ev->a2 = a2;
-    ev->a3 = a3; ev->a4 = a4; ev->a5 = a5;
-    ev->caller_addr = 0;
-    ev->pc = 0;
-    ev->clone_fn = 0;
-    ev->fd_path[0] = 0;
-
-    /* Capture PC and caller (tier2) from pt_regs */
-    regs = get_pt_regs();
-    if (regs) {
-        ev->pc = regs[REG_PC];
-        if (g_tier2_enabled) {
-            /* x30 (LR) is at index 30 */
-            ev->caller_addr = regs[30];
-        }
-    }
-
-    /* Tier2: fd-to-path for fd-based syscalls */
-    if (g_tier2_enabled) {
-        int fd = -1;
-        switch (nr) {
-        case __NR_read: case __NR_write: case __NR_readv: case __NR_writev:
-        case __NR_pread64: case __NR_pwrite64: case __NR_lseek:
-        case __NR_fstat: case __NR_fsync: case __NR_fdatasync:
-        case __NR_ftruncate: case __NR_fchmod: case __NR_fchown:
-        case __NR_ioctl: case __NR_fcntl: case __NR_getdents64:
-        case __NR_close:
-            fd = (int)a0;
-            break;
-        case __NR_sendto: case __NR_recvfrom:
-        case __NR_setsockopt: case __NR_getsockopt:
-        case __NR_sendmsg: case __NR_recvmsg:
-        case __NR_shutdown: case __NR_bind: case __NR_connect:
-        case __NR_listen: case __NR_accept: case __NR_accept4:
-            fd = (int)a0;
-            break;
-        default: break;
-        }
-        if (fd >= 0) {
-            /* Resolve fd via /proc/self/fd/N using readlinkat syscall */
-            char fdpath[32];
-            int plen = 0;
-            fdpath[0] = '/'; fdpath[1] = 'p'; fdpath[2] = 'r'; fdpath[3] = 'o';
-            fdpath[4] = 'c'; fdpath[5] = '/'; fdpath[6] = 's'; fdpath[7] = 'e';
-            fdpath[8] = 'l'; fdpath[9] = 'f'; fdpath[10] = '/'; fdpath[11] = 'f';
-            fdpath[12] = 'd'; fdpath[13] = '/';
-            plen = 14;
-            /* int to string for fd */
-            {
-                char digits[12];
-                int dlen = 0, fv = fd < 0 ? -fd : fd;
-                if (fv == 0) { digits[dlen++] = '0'; }
-                else { while (fv > 0 && dlen < 10) { digits[dlen++] = '0' + (fv % 10); fv /= 10; } }
-                if (fd < 0) fdpath[plen++] = '-';
-                while (dlen > 0) fdpath[plen++] = digits[--dlen];
-                fdpath[plen] = 0;
-            }
-            {
-                long rlen = raw_syscall4(__NR_readlinkat, -100,
-                    (unsigned long)fdpath, (unsigned long)ev->fd_path, MAX_PATH_LEN - 1);
-                if (rlen > 0 && rlen < MAX_PATH_LEN) ev->fd_path[rlen] = 0;
-                else ev->fd_path[0] = 0;
+    if (g_target_comm[0]) {
+        char comm[MAX_COMM_LEN];
+        get_current_comm(comm, sizeof(comm));
+        {
+            int ci;
+            for (ci = 0; ci < MAX_COMM_LEN; ci++) {
+                if (g_target_comm[ci] != comm[ci]) { g_in_hook = 0; return; }
+                if (!g_target_comm[ci]) break;
             }
         }
     }
 
-    deep_parse_args(ev);
+    /* Initialize event */
+    kp_memset(&ev, 0, sizeof(ev));
+    ev.timestamp = get_timestamp_ns();
+    ev.seq = __sync_fetch_and_add(&g_seq, 1);
+    ev.nr = nr;
+    ev.pid = pid;
+    ev.tid = tid;
+    ev.uid = uid;
+    get_current_comm(ev.comm, sizeof(ev.comm));
+
+    /* v9 FIX: use syscall_args() to get real arguments */
+    real_args = syscall_args(fargs_raw);
+    if (real_args) {
+        ev.args[0] = real_args[0];
+        ev.args[1] = real_args[1];
+        ev.args[2] = real_args[2];
+        ev.args[3] = real_args[3];
+        ev.args[4] = real_args[4];
+        ev.args[5] = real_args[5];
+    }
+
+    /* Deep parse arguments */
+    deep_parse_args(nr, ev.args, ev.arg_detail, sizeof(ev.arg_detail));
+
+    /* Capture caller PC/LR */
+    capture_caller(&ev, fargs_raw);
+
+    /* Resolve SO + offset */
+    resolve_caller(&ev);
+
+    /* Push to ring buffer */
+    push_event(&ev);
+
+    g_in_hook = 0;
+}
+
+static void before_any(hook_fargs6_t *args, void *udata)
+{
+    before_syscall_from_hook((void *)args, (int)(unsigned long)udata);
 }
 
 /* ================================================================
- * HOOK_ENTRY macros -- generate hook functions for each syscall
+ * Hook entry macros - one before_NR function per syscall number
  * ================================================================ */
+
 #define HOOK_ENTRY(NR) \
     static void before_##NR(hook_fargs6_t *args, void *udata) { \
-        (void)udata; \
-        before_syscall(NR, args->arg0, args->arg1, args->arg2, \
-                       args->arg3, args->arg4, args->arg5); \
+        before_syscall_from_hook((void *)args, NR); \
     }
 
-/* Tier1 hooks */
-HOOK_ENTRY(56)  HOOK_ENTRY(57)  HOOK_ENTRY(63)  HOOK_ENTRY(64)
-HOOK_ENTRY(35)  HOOK_ENTRY(34)  HOOK_ENTRY(53)  HOOK_ENTRY(54)
-HOOK_ENTRY(48)  HOOK_ENTRY(78)  HOOK_ENTRY(79)  HOOK_ENTRY(80)
-HOOK_ENTRY(82)  HOOK_ENTRY(83)  HOOK_ENTRY(62)  HOOK_ENTRY(61)
-HOOK_ENTRY(67)  HOOK_ENTRY(68)  HOOK_ENTRY(65)  HOOK_ENTRY(66)
-HOOK_ENTRY(45)  HOOK_ENTRY(46)  HOOK_ENTRY(47)  HOOK_ENTRY(29)
-HOOK_ENTRY(25)  HOOK_ENTRY(23)  HOOK_ENTRY(24)
-HOOK_ENTRY(198) HOOK_ENTRY(200) HOOK_ENTRY(201) HOOK_ENTRY(202)
-HOOK_ENTRY(203) HOOK_ENTRY(206) HOOK_ENTRY(207) HOOK_ENTRY(208)
-HOOK_ENTRY(209) HOOK_ENTRY(210) HOOK_ENTRY(211) HOOK_ENTRY(212)
-HOOK_ENTRY(220) HOOK_ENTRY(221) HOOK_ENTRY(129) HOOK_ENTRY(131)
+HOOK_ENTRY(0)
+HOOK_ENTRY(1)
+HOOK_ENTRY(2)
+HOOK_ENTRY(3)
+HOOK_ENTRY(4)
+
+HOOK_ENTRY(5)
+HOOK_ENTRY(8)
+HOOK_ENTRY(11)
+HOOK_ENTRY(14)
+HOOK_ENTRY(17)
+
+HOOK_ENTRY(19)
+HOOK_ENTRY(20)
+HOOK_ENTRY(21)
+HOOK_ENTRY(22)
+HOOK_ENTRY(23)
+
+HOOK_ENTRY(24)
+HOOK_ENTRY(25)
+HOOK_ENTRY(26)
+HOOK_ENTRY(27)
+HOOK_ENTRY(28)
+
+HOOK_ENTRY(29)
+HOOK_ENTRY(30)
+HOOK_ENTRY(31)
+HOOK_ENTRY(32)
+HOOK_ENTRY(33)
+
+HOOK_ENTRY(34)
+HOOK_ENTRY(35)
+HOOK_ENTRY(36)
+HOOK_ENTRY(37)
+HOOK_ENTRY(38)
+
+HOOK_ENTRY(39)
+HOOK_ENTRY(40)
+HOOK_ENTRY(43)
+HOOK_ENTRY(44)
+HOOK_ENTRY(45)
+
+HOOK_ENTRY(46)
+HOOK_ENTRY(47)
+HOOK_ENTRY(48)
+HOOK_ENTRY(49)
+HOOK_ENTRY(50)
+
+HOOK_ENTRY(51)
+HOOK_ENTRY(52)
+HOOK_ENTRY(53)
+HOOK_ENTRY(54)
+HOOK_ENTRY(55)
+
+HOOK_ENTRY(56)
+HOOK_ENTRY(57)
+HOOK_ENTRY(59)
+HOOK_ENTRY(61)
+HOOK_ENTRY(62)
+
+HOOK_ENTRY(63)
+HOOK_ENTRY(64)
+HOOK_ENTRY(65)
+HOOK_ENTRY(66)
+HOOK_ENTRY(67)
+
+HOOK_ENTRY(68)
+HOOK_ENTRY(71)
+HOOK_ENTRY(72)
+HOOK_ENTRY(73)
+HOOK_ENTRY(76)
+
+HOOK_ENTRY(78)
+HOOK_ENTRY(79)
+HOOK_ENTRY(80)
+HOOK_ENTRY(81)
+HOOK_ENTRY(82)
+
+HOOK_ENTRY(83)
+HOOK_ENTRY(85)
+HOOK_ENTRY(88)
+HOOK_ENTRY(89)
+HOOK_ENTRY(90)
+
+HOOK_ENTRY(91)
+HOOK_ENTRY(93)
+HOOK_ENTRY(94)
+HOOK_ENTRY(95)
+HOOK_ENTRY(96)
+
+HOOK_ENTRY(97)
+HOOK_ENTRY(98)
+HOOK_ENTRY(99)
+HOOK_ENTRY(100)
+HOOK_ENTRY(101)
+
+HOOK_ENTRY(103)
+HOOK_ENTRY(105)
+HOOK_ENTRY(106)
+HOOK_ENTRY(113)
+HOOK_ENTRY(114)
+
+HOOK_ENTRY(115)
+HOOK_ENTRY(116)
+HOOK_ENTRY(117)
+HOOK_ENTRY(124)
+HOOK_ENTRY(129)
+
+HOOK_ENTRY(130)
+HOOK_ENTRY(131)
+HOOK_ENTRY(132)
+HOOK_ENTRY(134)
+HOOK_ENTRY(135)
+
+HOOK_ENTRY(140)
+HOOK_ENTRY(141)
+HOOK_ENTRY(142)
+HOOK_ENTRY(146)
+HOOK_ENTRY(147)
+
+HOOK_ENTRY(153)
+HOOK_ENTRY(154)
+HOOK_ENTRY(157)
+HOOK_ENTRY(160)
+HOOK_ENTRY(163)
+
+HOOK_ENTRY(164)
+HOOK_ENTRY(166)
+HOOK_ENTRY(167)
+HOOK_ENTRY(168)
+HOOK_ENTRY(169)
+
+HOOK_ENTRY(172)
+HOOK_ENTRY(173)
+HOOK_ENTRY(174)
+HOOK_ENTRY(175)
+HOOK_ENTRY(176)
+
+HOOK_ENTRY(177)
+HOOK_ENTRY(178)
+HOOK_ENTRY(179)
+HOOK_ENTRY(186)
+HOOK_ENTRY(187)
+
+HOOK_ENTRY(188)
+HOOK_ENTRY(189)
+HOOK_ENTRY(190)
+HOOK_ENTRY(191)
+HOOK_ENTRY(194)
+
+HOOK_ENTRY(195)
+HOOK_ENTRY(196)
+HOOK_ENTRY(197)
+HOOK_ENTRY(198)
+HOOK_ENTRY(199)
+
+HOOK_ENTRY(200)
+HOOK_ENTRY(201)
+HOOK_ENTRY(202)
+HOOK_ENTRY(203)
+HOOK_ENTRY(204)
+
+HOOK_ENTRY(205)
+HOOK_ENTRY(206)
+HOOK_ENTRY(207)
+HOOK_ENTRY(208)
+HOOK_ENTRY(209)
+
+HOOK_ENTRY(210)
+HOOK_ENTRY(211)
+HOOK_ENTRY(212)
+HOOK_ENTRY(214)
+HOOK_ENTRY(215)
+
+HOOK_ENTRY(216)
+HOOK_ENTRY(220)
+HOOK_ENTRY(221)
 HOOK_ENTRY(222)
-/* Tier2 hooks */
-HOOK_ENTRY(40)  HOOK_ENTRY(39)  HOOK_ENTRY(76)  HOOK_ENTRY(71)
-HOOK_ENTRY(117) HOOK_ENTRY(167) HOOK_ENTRY(261) HOOK_ENTRY(277)
-HOOK_ENTRY(105) HOOK_ENTRY(106) HOOK_ENTRY(273) HOOK_ENTRY(280)
-HOOK_ENTRY(281) HOOK_ENTRY(226) HOOK_ENTRY(233) HOOK_ENTRY(214)
-HOOK_ENTRY(215) HOOK_ENTRY(216) HOOK_ENTRY(228) HOOK_ENTRY(229)
-HOOK_ENTRY(5)   HOOK_ENTRY(8)   HOOK_ENTRY(14)  HOOK_ENTRY(88)
+HOOK_ENTRY(226)
+
+HOOK_ENTRY(227)
+HOOK_ENTRY(228)
+HOOK_ENTRY(229)
+HOOK_ENTRY(233)
+HOOK_ENTRY(240)
+
+HOOK_ENTRY(241)
+HOOK_ENTRY(242)
+HOOK_ENTRY(260)
+HOOK_ENTRY(261)
+HOOK_ENTRY(268)
+
+HOOK_ENTRY(269)
+HOOK_ENTRY(270)
+HOOK_ENTRY(271)
+HOOK_ENTRY(272)
+HOOK_ENTRY(273)
+
+HOOK_ENTRY(276)
+HOOK_ENTRY(277)
+HOOK_ENTRY(278)
+HOOK_ENTRY(279)
+HOOK_ENTRY(280)
+
+HOOK_ENTRY(281)
+HOOK_ENTRY(284)
+HOOK_ENTRY(285)
+HOOK_ENTRY(291)
+HOOK_ENTRY(424)
+
+HOOK_ENTRY(425)
+HOOK_ENTRY(426)
+HOOK_ENTRY(427)
+HOOK_ENTRY(434)
 HOOK_ENTRY(435)
 
+HOOK_ENTRY(436)
+HOOK_ENTRY(437)
+HOOK_ENTRY(438)
+HOOK_ENTRY(439)
+
+
 /* ================================================================
- * Hook install/remove helpers
+ * Hook install / remove - v9 fix: correct API signatures
+ *   hook_syscalln(nr, narg, before, after, udata)  -> 5 params
+ *   unhook_syscalln(nr, before, after)             -> 3 params
  * ================================================================ */
-static int install_hook(int nr) {
-    switch (nr) {
-#define CASE_HOOK(N) case N: return hook_syscalln(N, 6, before_##N, 0, 0)
-    CASE_HOOK(56); CASE_HOOK(57); CASE_HOOK(63); CASE_HOOK(64);
-    CASE_HOOK(35); CASE_HOOK(34); CASE_HOOK(53); CASE_HOOK(54);
-    CASE_HOOK(48); CASE_HOOK(78); CASE_HOOK(79); CASE_HOOK(80);
-    CASE_HOOK(82); CASE_HOOK(83); CASE_HOOK(62); CASE_HOOK(61);
-    CASE_HOOK(67); CASE_HOOK(68); CASE_HOOK(65); CASE_HOOK(66);
-    CASE_HOOK(45); CASE_HOOK(46); CASE_HOOK(47); CASE_HOOK(29);
-    CASE_HOOK(25); CASE_HOOK(23); CASE_HOOK(24);
-    CASE_HOOK(198); CASE_HOOK(200); CASE_HOOK(201); CASE_HOOK(202);
-    CASE_HOOK(203); CASE_HOOK(206); CASE_HOOK(207); CASE_HOOK(208);
-    CASE_HOOK(209); CASE_HOOK(210); CASE_HOOK(211); CASE_HOOK(212);
-    CASE_HOOK(220); CASE_HOOK(221); CASE_HOOK(129); CASE_HOOK(131);
-    CASE_HOOK(222);
-    CASE_HOOK(40); CASE_HOOK(39); CASE_HOOK(76); CASE_HOOK(71);
-    CASE_HOOK(117); CASE_HOOK(167); CASE_HOOK(261); CASE_HOOK(277);
-    CASE_HOOK(105); CASE_HOOK(106); CASE_HOOK(273); CASE_HOOK(280);
-    CASE_HOOK(281); CASE_HOOK(226); CASE_HOOK(233); CASE_HOOK(214);
-    CASE_HOOK(215); CASE_HOOK(216); CASE_HOOK(228); CASE_HOOK(229);
-    CASE_HOOK(5); CASE_HOOK(8); CASE_HOOK(14); CASE_HOOK(88);
-    CASE_HOOK(435);
-#undef CASE_HOOK
-    default: return -1;
+
+static int install_hook(int nr)
+{
+    int ret;
+    ret = hook_syscalln(nr, 6, (void *)before_any, NULL, (void *)(unsigned long)nr);
+    if (ret == 0) {
+        if (g_hook_count < MAX_HOOKS) {
+            g_hooked_nrs[g_hook_count++] = nr;
+        }
+        bitmap_set(nr);
     }
+    return ret;
 }
 
-static void remove_hook(int nr) {
-    switch (nr) {
-#define CASE_UNHOOK(N) case N: unhook_syscalln(N, before_##N, 0); break
-    CASE_UNHOOK(56); CASE_UNHOOK(57); CASE_UNHOOK(63); CASE_UNHOOK(64);
-    CASE_UNHOOK(35); CASE_UNHOOK(34); CASE_UNHOOK(53); CASE_UNHOOK(54);
-    CASE_UNHOOK(48); CASE_UNHOOK(78); CASE_UNHOOK(79); CASE_UNHOOK(80);
-    CASE_UNHOOK(82); CASE_UNHOOK(83); CASE_UNHOOK(62); CASE_UNHOOK(61);
-    CASE_UNHOOK(67); CASE_UNHOOK(68); CASE_UNHOOK(65); CASE_UNHOOK(66);
-    CASE_UNHOOK(45); CASE_UNHOOK(46); CASE_UNHOOK(47); CASE_UNHOOK(29);
-    CASE_UNHOOK(25); CASE_UNHOOK(23); CASE_UNHOOK(24);
-    CASE_UNHOOK(198); CASE_UNHOOK(200); CASE_UNHOOK(201); CASE_UNHOOK(202);
-    CASE_UNHOOK(203); CASE_UNHOOK(206); CASE_UNHOOK(207); CASE_UNHOOK(208);
-    CASE_UNHOOK(209); CASE_UNHOOK(210); CASE_UNHOOK(211); CASE_UNHOOK(212);
-    CASE_UNHOOK(220); CASE_UNHOOK(221); CASE_UNHOOK(129); CASE_UNHOOK(131);
-    CASE_UNHOOK(222);
-    CASE_UNHOOK(40); CASE_UNHOOK(39); CASE_UNHOOK(76); CASE_UNHOOK(71);
-    CASE_UNHOOK(117); CASE_UNHOOK(167); CASE_UNHOOK(261); CASE_UNHOOK(277);
-    CASE_UNHOOK(105); CASE_UNHOOK(106); CASE_UNHOOK(273); CASE_UNHOOK(280);
-    CASE_UNHOOK(281); CASE_UNHOOK(226); CASE_UNHOOK(233); CASE_UNHOOK(214);
-    CASE_UNHOOK(215); CASE_UNHOOK(216); CASE_UNHOOK(228); CASE_UNHOOK(229);
-    CASE_UNHOOK(5); CASE_UNHOOK(8); CASE_UNHOOK(14); CASE_UNHOOK(88);
-    CASE_UNHOOK(435);
-#undef CASE_UNHOOK
-    default: break;
+static void remove_hook(int nr)
+{
+    unhook_syscalln(nr, (void *)before_any, NULL);
+    bitmap_clear(nr);
+}
+
+static void remove_all_hooks(void)
+{
+    int i;
+    for (i = 0; i < g_hook_count; i++) {
+        remove_hook(g_hooked_nrs[i]);
     }
-}
-
-static int g_tier1_hooked = 0;
-static int g_tier2_hooked = 0;
-
-static void install_tier1(void) {
-    unsigned int i;
-    if (g_tier1_hooked) return;
-    for (i = 0; i < TIER1_COUNT; i++)
-        install_hook(tier1_nrs[i]);
-    g_tier1_hooked = 1;
-    printk("svc_monitor: tier1 hooks installed (%u)\n", (unsigned)TIER1_COUNT);
-}
-
-static void remove_tier1(void) {
-    unsigned int i;
-    if (!g_tier1_hooked) return;
-    for (i = 0; i < TIER1_COUNT; i++)
-        remove_hook(tier1_nrs[i]);
-    g_tier1_hooked = 0;
-    printk("svc_monitor: tier1 hooks removed\n");
-}
-
-static void install_tier2(void) {
-    unsigned int i;
-    if (g_tier2_hooked) return;
-    for (i = 0; i < TIER2_COUNT; i++)
-        install_hook(tier2_nrs[i]);
-    g_tier2_hooked = 1;
-    g_tier2_enabled = 1;
-    printk("svc_monitor: tier2 hooks installed (%u)\n", (unsigned)TIER2_COUNT);
-}
-
-static void remove_tier2(void) {
-    unsigned int i;
-    if (!g_tier2_hooked) return;
-    for (i = 0; i < TIER2_COUNT; i++)
-        remove_hook(tier2_nrs[i]);
-    g_tier2_hooked = 0;
-    g_tier2_enabled = 0;
-    printk("svc_monitor: tier2 hooks removed\n");
+    g_hook_count = 0;
 }
 
 /* ================================================================
- * Command: drain events as JSON
+ * Tier / Preset definitions
  * ================================================================ */
-static int drain_events(void) {
-    int i, off = 0, cnt;
-    char esc1[TASK_COMM_LEN * 2 + 4];
-    char esc2[MAX_DESC_LEN * 2 + 4];
-    char esc3[MAX_PATH_LEN * 2 + 4];
-    cnt = g_count;
-    off += snprintf(g_outbuf + off, OUTBUF_SIZE - off, "{\"ok\":true,\"events\":[");
-    for (i = 0; i < cnt && off < OUTBUF_SIZE - 1024; i++) {
-        int ei = (g_tail + i) % MAX_EVENTS;
-        struct svc_event *ev = &g_events[ei];
-        json_escape(esc1, sizeof(esc1), ev->comm);
-        json_escape(esc2, sizeof(esc2), ev->desc);
-        json_escape(esc3, sizeof(esc3), ev->fd_path);
-        off += snprintf(g_outbuf + off, OUTBUF_SIZE - off,
-            "%s{\"seq\":%lu,\"nr\":%d,\"name\":\"%s\",\"pid\":%d,\"uid\":%d,"
-            "\"comm\":\"%s\",\"a0\":%lu,\"a1\":%lu,\"a2\":%lu,"
-            "\"a3\":%lu,\"a4\":%lu,\"a5\":%lu,"
-            "\"desc\":\"%s\",\"caller\":\"0x%lx\",\"pc\":\"0x%lx\","
-            "\"fdPath\":\"%s\",\"cloneFn\":%lu}",
-            i ? "," : "",
-            ev->seq, ev->nr, nr_to_name(ev->nr), ev->pid, ev->uid,
-            esc1, ev->a0, ev->a1, ev->a2, ev->a3, ev->a4, ev->a5,
-            esc2, ev->caller_addr, ev->pc, esc3, ev->clone_fn);
+
+static const int g_tier1_nrs[] = {
+    56, 57, 63, 64, 221, 281, 220, 435, 129, 131, 117, 198, 203, 200, 201, 
+    206, 207, 211, 212, 222, 226, 215, 40, 39, 167, 277, 280, 105, 106, 273, 
+    48, 439, 35, 34, 53, 54, 78, 36, 37, 38, 276, 61, 93, 94, 260, 
+    95, 270, 271
+};
+static const int g_tier1_count = 48;
+
+static const int g_tier2_nrs[] = {
+    29, 25, 79, 80, 291, 43, 44, 62, 65, 66, 67, 68, 71, 85, 88, 
+    214, 216, 233, 228, 229, 98, 20, 21, 22, 23, 24, 59, 19, 26, 27, 
+    28, 134, 135, 130, 132, 240, 261, 163, 164, 146, 147, 140, 141, 160, 167, 
+    179, 113, 114, 115, 169, 101, 103, 116, 208, 209, 210, 242, 269, 243, 268, 
+    97, 51, 49, 50, 166, 82, 83, 81, 278, 279, 241, 425, 426, 427, 424, 
+    434, 436, 437, 438, 194, 195, 196, 197, 186, 187, 188, 189, 190, 191
+};
+static const int g_tier2_count = 89;
+
+static int install_tier1(void)
+{
+    int i, ok = 0;
+    for (i = 0; i < g_tier1_count; i++) {
+        if (install_hook(g_tier1_nrs[i]) == 0) ok++;
     }
-    off += snprintf(g_outbuf + off, OUTBUF_SIZE - off, "],\"total\":%lu,\"drained\":%d}", g_total, i);
-    g_head = 0; g_tail = 0; g_count = 0;
-    return write_output_file(OUTPUT_PATH, g_outbuf, off);
+    return ok;
+}
+
+static int install_tier2(void)
+{
+    int i, ok = 0;
+    for (i = 0; i < g_tier2_count; i++) {
+        if (install_hook(g_tier2_nrs[i]) == 0) ok++;
+    }
+    return ok;
+}
+
+static int install_all(void)
+{
+    return install_tier1() + install_tier2();
 }
 
 /* ================================================================
- * Command: status JSON
+ * Drain events to output buffer as JSON lines
  * ================================================================ */
-static int output_status(void) {
-    int off = 0;
-    char nrlist[4096];
-    bitmap_list(nrlist, sizeof(nrlist));
-    off += snprintf(g_outbuf + off, OUTBUF_SIZE - off,
-        "{\"ok\":true,\"enabled\":%d,\"uid\":%d,\"tier2\":%d,"
-        "\"eventsTotal\":%lu,\"eventsBuffered\":%d,"
-        "\"nrFilter\":\"%s\",\"tier1Hooked\":%d,\"tier2Hooked\":%d,"
-        "\"version\":\"8.3.0\"}",
-        g_enabled, g_uid_filter, g_tier2_enabled,
-        g_total, g_count, nrlist, g_tier1_hooked, g_tier2_hooked);
-    return write_output_file(OUTPUT_PATH, g_outbuf, off);
+
+static void drain_events(void)
+{
+    struct svc_event ev;
+    char detail_esc[1024];
+    char so_esc[512];
+    char comm_esc[64];
+    int count = 0;
+
+    g_outpos = 0;
+    g_outbuf[0] = '\0';
+
+    while (pop_event(&ev) && g_outpos < OUTPUT_BUF_SIZE - 2048) {
+        json_escape(ev.arg_detail, detail_esc, sizeof(detail_esc));
+        json_escape(ev.caller_so, so_esc, sizeof(so_esc));
+        json_escape(ev.comm, comm_esc, sizeof(comm_esc));
+
+        g_outpos += __builtin_snprintf(g_outbuf + g_outpos, OUTPUT_BUF_SIZE - g_outpos,
+            "{\"seq\":%u,\"ts\":%llu,\"nr\":%d,\"name\":\"%s\","
+            "\"pid\":%d,\"tid\":%d,\"uid\":%u,\"comm\":\"%s\","
+            "\"args\":\"%s\","
+            "\"callerPC\":\"0x%llx\",\"callerLR\":\"0x%llx\","
+            "\"callerSo\":\"%s\",\"callerOffset\":\"0x%llx\"}\n",
+            ev.seq, ev.timestamp, ev.nr, get_syscall_name(ev.nr),
+            ev.pid, ev.tid, ev.uid, comm_esc,
+            detail_esc,
+            ev.caller_pc, ev.caller_lr,
+            so_esc, ev.caller_offset);
+        count++;
+    }
+
+    if (count == 0) {
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"status\":\"no_events\",\"dropped\":%d}\n", g_ev_dropped);
+    }
 }
 
-/* ================================================================
- * Command: apply preset
- * ================================================================ */
-static int apply_preset(int preset_id) {
-    int pi, i;
-    if (preset_id == 9) {
-        /* all */
-        bitmap_set_all();
-        if (!g_tier2_hooked) install_tier2();
-        return 0;
+static void output_status(void)
+{
+    g_outpos = 0;
+    g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+        "{\"version\":\"9.0.0\",\"running\":%d,\"hooks\":%d,"
+        "\"events\":%d,\"dropped\":%d,\"seq\":%u,"
+        "\"target_pid\":%d,\"target_uid\":%u,"
+        "\"target_comm\":\"%s\","
+        "\"maps_cache_pid\":%d,\"maps_cache_entries\":%d}\n",
+        g_running, g_hook_count, g_ev_count, g_ev_dropped, g_seq,
+        g_target_pid, g_target_uid, g_target_comm,
+        g_maps_cache.pid, g_maps_cache.count);
+}
+
+static void apply_preset(const char *name)
+{
+    int ok;
+    g_outpos = 0;
+
+    if (!name) {
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"error\":\"no preset name\"}\n");
+        return;
     }
-    for (pi = 0; presets[pi].id; pi++) {
-        if (presets[pi].id == preset_id) {
-            bitmap_clear_all();
-            for (i = 0; i < presets[pi].count; i++)
-                bitmap_set(presets[pi].nrs[i]);
-            return 0;
+
+    /* Compare preset names manually */
+    {
+        int match_tier1 = (name[0]=='t' && name[1]=='i' && name[2]=='e' && name[3]=='r' && name[4]=='1' && name[5]=='\0');
+        int match_tier2 = (name[0]=='t' && name[1]=='i' && name[2]=='e' && name[3]=='r' && name[4]=='2' && name[5]=='\0');
+        int match_all = (name[0]=='a' && name[1]=='l' && name[2]=='l' && name[3]=='\0');
+
+        if (match_tier1) ok = install_tier1();
+        else if (match_tier2) ok = install_all();
+        else if (match_all) ok = install_all();
+        else {
+            g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+                "{\"error\":\"unknown preset: %s\"}\n", name);
+            return;
         }
     }
-    return -1;
+
+    g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+        "{\"preset\":\"%s\",\"hooks_installed\":%d}\n", name, ok);
 }
 
-/* ================================================================
- * Simple string-to-int
- * ================================================================ */
-static int str_to_int(const char *s) {
-    int val = 0, neg = 0;
-    if (!s) return 0;
-    while (*s == ' ') s++;
-    if (*s == '-') { neg = 1; s++; }
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (*s - '0');
-        s++;
+static int str_eq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
     }
+    return (*a == *b);
+}
+
+static int simple_atoi(const char *s)
+{
+    int val = 0, neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
     return neg ? -val : val;
 }
 
-/* ================================================================
- * Simple command argument parser
- * Finds the first space after command name, returns pointer to args
- * ================================================================ */
-static const char *cmd_args(const char *cmd, const char *prefix) {
-    int plen = strlen(prefix);
-    if (strncmp(cmd, prefix, plen) != 0) return 0;
-    if (cmd[plen] == 0) return cmd + plen;
-    if (cmd[plen] == ' ') return cmd + plen + 1;
-    return 0;
+static const char *next_token(const char *s)
+{
+    while (*s && *s != ' ' && *s != '\t') s++;
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
 }
 
 /* ================================================================
- * KPM_CTL0 -- command dispatcher
+ * CTL0 command dispatcher
  * ================================================================ */
-__attribute__((used))
-static long svc_ctl0(const char *args, char *__user out_msg, int outlen) {
-    int off, i, cnt;
-    const char *p;
 
-    if (!args) return -1;
+static void ctl0_dispatch(const char *cmd, char *outbuf, int outlen)
+{
+    g_outbuf[0] = '\0';
+    g_outpos = 0;
 
-    /* enable */
-    if (strcmp(args, "enable") == 0) {
-        if (!g_tier1_hooked) install_tier1();
-        g_enabled = 1;
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"enabled\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* disable */
-    if (strcmp(args, "disable") == 0) {
-        g_enabled = 0;
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"disabled\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* status */
-    if (strcmp(args, "status") == 0) {
+    if (!cmd || !cmd[0]) {
         output_status();
-        return 0;
+        return;
     }
-    /* drain */
-    if (strcmp(args, "drain") == 0) {
+
+    if (str_eq(cmd, "status")) {
+        output_status();
+    }
+    else if (str_eq(cmd, "start")) {
+        g_running = 1;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"start\",\"running\":1,\"hooks\":%d}\n", g_hook_count);
+    }
+    else if (str_eq(cmd, "stop")) {
+        g_running = 0;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"stop\",\"running\":0}\n");
+    }
+    else if (str_eq(cmd, "read")) {
         drain_events();
-        return 0;
     }
-    /* clear */
-    if (strcmp(args, "clear") == 0) {
-        g_head = 0; g_tail = 0; g_count = 0;
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"cleared\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+    else if (str_eq(cmd, "clear")) {
+        g_ev_head = 0;
+        g_ev_tail = 0;
+        g_ev_count = 0;
+        g_ev_dropped = 0;
+        g_seq = 0;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"clear\",\"events\":0}\n");
     }
-    /* uid <N> */
-    p = cmd_args(args, "uid");
-    if (p) {
-        g_uid_filter = str_to_int(p);
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"uid\":%d}", g_uid_filter);
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* enable_nr <N> */
-    p = cmd_args(args, "enable_nr");
-    if (p) {
-        int nr = str_to_int(p);
-        bitmap_set(nr);
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"enabled_nr\":%d}", nr);
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* disable_nr <N> */
-    p = cmd_args(args, "disable_nr");
-    if (p) {
-        int nr = str_to_int(p);
-        bitmap_clear(nr);
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"disabled_nr\":%d}", nr);
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* set_nrs <n1,n2,...> */
-    p = cmd_args(args, "set_nrs");
-    if (p) {
-        int nr;
-        bitmap_clear_all();
-        while (*p) {
-            while (*p == ' ' || *p == ',') p++;
-            if (*p == 0) break;
-            nr = 0;
-            while (*p >= '0' && *p <= '9') { nr = nr * 10 + (*p - '0'); p++; }
-            bitmap_set(nr);
+    else if (cmd[0]=='p' && cmd[1]=='i' && cmd[2]=='d' && (cmd[3]==' ' || cmd[3]=='\0')) {
+        if (cmd[3] == ' ') {
+            g_target_pid = simple_atoi(cmd + 4);
+            /* Invalidate maps cache for new target */
+            g_maps_cache.pid = 0;
+            g_maps_cache.count = 0;
         }
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"nrs_set\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"target_pid\":%d}\n", g_target_pid);
     }
-    /* enable_all_nr */
-    if (strcmp(args, "enable_all_nr") == 0) {
-        bitmap_set_all();
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"all_enabled\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+    else if (cmd[0]=='u' && cmd[1]=='i' && cmd[2]=='d' && (cmd[3]==' ' || cmd[3]=='\0')) {
+        if (cmd[3] == ' ') g_target_uid = (unsigned int)simple_atoi(cmd + 4);
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"target_uid\":%u}\n", g_target_uid);
     }
-    /* disable_all_nr */
-    if (strcmp(args, "disable_all_nr") == 0) {
-        bitmap_clear_all();
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"msg\":\"all_disabled\"}");
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
-    }
-    /* preset <1-9> */
-    p = cmd_args(args, "preset");
-    if (p) {
-        int pid = str_to_int(p);
-        if (apply_preset(pid) == 0) {
-            off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"preset\":%d}", pid);
-        } else {
-            off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":false,\"error\":\"invalid preset\"}");
+    else if (cmd[0]=='c' && cmd[1]=='o' && cmd[2]=='m' && cmd[3]=='m' && (cmd[4]==' ' || cmd[4]=='\0')) {
+        if (cmd[4] == ' ') {
+            int ci;
+            const char *src = cmd + 5;
+            for (ci = 0; ci < MAX_COMM_LEN - 1 && src[ci]; ci++)
+                g_target_comm[ci] = src[ci];
+            g_target_comm[ci] = '\0';
         }
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"target_comm\":\"%s\"}\n", g_target_comm);
     }
-    /* tier2 <0|1> */
-    p = cmd_args(args, "tier2");
-    if (p) {
-        int val = str_to_int(p);
-        if (val && !g_tier2_hooked) install_tier2();
-        else if (!val && g_tier2_hooked) remove_tier2();
-        off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":true,\"tier2\":%d}", g_tier2_enabled);
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+    else if (cmd[0]=='p' && cmd[1]=='r' && cmd[2]=='e' && cmd[3]=='s' && cmd[4]=='e' && cmd[5]=='t' && cmd[6]==' ') {
+        apply_preset(cmd + 7);
     }
-    /* events (non-draining peek) */
-    if (strcmp(args, "events") == 0) {
-        char esc1[TASK_COMM_LEN * 2 + 4];
-        char esc2[MAX_DESC_LEN * 2 + 4];
-        char esc3[MAX_PATH_LEN * 2 + 4];
-        cnt = g_count; off = 0;
-        off += snprintf(g_outbuf + off, OUTBUF_SIZE - off, "{\"ok\":true,\"events\":[");
-        for (i = 0; i < cnt && off < OUTBUF_SIZE - 1024; i++) {
-            int ei = (g_tail + i) % MAX_EVENTS;
-            struct svc_event *ev = &g_events[ei];
-            json_escape(esc1, sizeof(esc1), ev->comm);
-            json_escape(esc2, sizeof(esc2), ev->desc);
-            json_escape(esc3, sizeof(esc3), ev->fd_path);
-            off += snprintf(g_outbuf + off, OUTBUF_SIZE - off,
-                "%s{\"seq\":%lu,\"nr\":%d,\"name\":\"%s\",\"pid\":%d,\"uid\":%d,"
-                "\"comm\":\"%s\",\"a0\":%lu,\"a1\":%lu,\"a2\":%lu,"
-                "\"a3\":%lu,\"a4\":%lu,\"a5\":%lu,"
-                "\"desc\":\"%s\",\"caller\":\"0x%lx\",\"pc\":\"0x%lx\","
-                "\"fdPath\":\"%s\",\"cloneFn\":%lu}",
-                i ? "," : "",
-                ev->seq, ev->nr, nr_to_name(ev->nr), ev->pid, ev->uid,
-                esc1, ev->a0, ev->a1, ev->a2, ev->a3, ev->a4, ev->a5,
-                esc2, ev->caller_addr, ev->pc, esc3, ev->clone_fn);
+    else if (cmd[0]=='h' && cmd[1]=='o' && cmd[2]=='o' && cmd[3]=='k' && cmd[4]==' ') {
+        int nr = simple_atoi(cmd + 5);
+        int ret = install_hook(nr);
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"hook\",\"nr\":%d,\"result\":%d}\n", nr, ret);
+    }
+    else if (cmd[0]=='u' && cmd[1]=='n' && cmd[2]=='h' && cmd[3]=='o' && cmd[4]=='o' && cmd[5]=='k' && cmd[6]==' ') {
+        int nr = simple_atoi(cmd + 7);
+        remove_hook(nr);
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"unhook\",\"nr\":%d}\n", nr);
+    }
+    else if (str_eq(cmd, "hooks")) {
+        int i;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE, "{\"hooks\":[");
+        for (i = 0; i < g_hook_count && g_outpos < OUTPUT_BUF_SIZE - 64; i++) {
+            if (i > 0) g_outpos += __builtin_snprintf(g_outbuf + g_outpos, OUTPUT_BUF_SIZE - g_outpos, ",");
+            g_outpos += __builtin_snprintf(g_outbuf + g_outpos, OUTPUT_BUF_SIZE - g_outpos,
+                "{\"nr\":%d,\"name\":\"%s\"}", g_hooked_nrs[i], get_syscall_name(g_hooked_nrs[i]));
         }
-        off += snprintf(g_outbuf + off, OUTBUF_SIZE - off, "],\"total\":%lu,\"buffered\":%d}", g_total, cnt);
-        write_output_file(OUTPUT_PATH, g_outbuf, off);
-        return 0;
+        g_outpos += __builtin_snprintf(g_outbuf + g_outpos, OUTPUT_BUF_SIZE - g_outpos, "]}\n");
     }
-    off = snprintf(g_outbuf, OUTBUF_SIZE, "{\"ok\":false,\"error\":\"unknown command\"}");
-    write_output_file(OUTPUT_PATH, g_outbuf, off);
-    return 0;
+    else if (str_eq(cmd, "maps_flush")) {
+        g_maps_cache.pid = 0;
+        g_maps_cache.count = 0;
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"action\":\"maps_flush\",\"ok\":1}\n");
+    }
+    else if (str_eq(cmd, "help")) {
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"commands\":["
+            "\"status\",\"start\",\"stop\",\"read\",\"clear\","
+            "\"pid <N>\",\"uid <N>\",\"comm <str>\","
+            "\"preset tier1|tier2|all\","
+            "\"hook <nr>\",\"unhook <nr>\",\"hooks\","
+            "\"maps_flush\",\"help\""
+            "]}\n");
+    }
+    else {
+        g_outpos = __builtin_snprintf(g_outbuf, OUTPUT_BUF_SIZE,
+            "{\"error\":\"unknown command\",\"cmd\":\"%s\"}\n", cmd);
+    }
 }
 
 /* ================================================================
- * KPM entry points
+ * KPM Entry Points
  * ================================================================ */
-__attribute__((used))
-static long svc_init(const char *args, const char *event, void *reserved) {
-    unsigned long i;
-    volatile char *p;
-    printk("svc_monitor: v8.3.0 loaded\n");
-    p = (volatile char *)g_events;
-    for (i = 0; i < sizeof(g_events); i++) p[i] = 0;
-    p = (volatile char *)g_nr_bitmap;
-    for (i = 0; i < sizeof(g_nr_bitmap); i++) p[i] = 0;
-    g_head = 0; g_tail = 0; g_count = 0;
-    g_total = 0; g_seq = 0;
-    g_enabled = 0;
-    g_uid_filter = -1;
-    g_tier2_enabled = 0;
-    g_tier1_hooked = 0;
-    g_tier2_hooked = 0;
+
+static long __attribute__((used)) svc_init(const char *args, const char *event, void *reserved)
+{
+    g_running = 0;
+    g_hook_count = 0;
+    g_ev_head = 0;
+    g_ev_tail = 0;
+    g_ev_count = 0;
+    g_ev_dropped = 0;
+    g_seq = 0;
+    g_in_hook = 0;
+    kp_memset(g_bitmap, 0, sizeof(g_bitmap));
+    kp_memset(g_target_comm, 0, sizeof(g_target_comm));
+    kp_memset(&g_maps_cache, 0, sizeof(g_maps_cache));
+    g_target_pid = 0;
+    g_target_uid = 0;
+    g_initialized = 1;
+    pr_info("svc_monitor v9.0.0 loaded\n");
     return 0;
 }
 
-__attribute__((used))
-static long svc_exit(void *reserved) {
-    g_enabled = 0;
-    if (g_tier2_hooked) remove_tier2();
-    if (g_tier1_hooked) remove_tier1();
-    printk("svc_monitor: unloaded\n");
+static long __attribute__((used)) svc_ctl0(const char *args, char *outbuf, int outlen)
+{
+    if (!g_initialized) return -1;
+
+    ctl0_dispatch(args, outbuf, outlen);
+
+    /* Copy output */
+    if (outbuf && outlen > 0 && g_outpos > 0) {
+        int copy_len = g_outpos < outlen - 1 ? g_outpos : outlen - 1;
+        kp_memcpy(outbuf, g_outbuf, copy_len);
+        outbuf[copy_len] = '\0';
+    }
+    return 0;
+}
+
+static long __attribute__((used)) svc_exit(void *reserved)
+{
+    g_running = 0;
+    remove_all_hooks();
+    g_initialized = 0;
+    pr_info("svc_monitor v9.0.0 unloaded\n");
     return 0;
 }
 

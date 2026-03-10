@@ -38,9 +38,6 @@ class MainViewModel : ViewModel() {
     val events: LiveData<List<StatusParser.SvcEvent>> = _events
     private val eventBuffer = mutableListOf<StatusParser.SvcEvent>()
     private val maxEvents = 2000
-    private var eventOffsetBytes: Long = 0L
-    private var eventCarry: String = ""
-    private val eventRotateThresholdBytes: Long = 4L * 1024L * 1024L
     var doFilpOpenEnabled: Boolean = true
 
     private val _eventCount = MutableLiveData(0)
@@ -62,6 +59,7 @@ class MainViewModel : ViewModel() {
     private var pollingPaused = false
 
     private val nrSet = mutableSetOf<Int>()
+    private var statusTick = 0
 
     fun startPolling() {
         if (pollingJob?.isActive == true) return
@@ -82,7 +80,25 @@ class MainViewModel : ViewModel() {
 
     private suspend fun pollOnce() {
         try {
-            // Poll status
+            if (_monitoring.value == true) {
+                val evResult = KpmBridge.drain(1024)
+                if (evResult.success && evResult.output.isNotEmpty()) {
+                    val drain = StatusParser.parseDrain(evResult.output)
+                    if (drain.ok && drain.events.isNotEmpty()) {
+                        synchronized(eventBuffer) {
+                            eventBuffer.addAll(drain.events)
+                            while (eventBuffer.size > maxEvents) {
+                                eventBuffer.removeAt(0)
+                            }
+                            _events.postValue(ArrayList(eventBuffer))
+                            _eventCount.postValue(eventBuffer.size)
+                        }
+                    }
+                }
+                statusTick++
+                if (statusTick % 3 != 0) return
+            }
+
             val statusResult = KpmBridge.status()
             if (statusResult.success && statusResult.output.isNotEmpty()) {
                 val s = StatusParser.parseStatus(statusResult.output)
@@ -95,58 +111,8 @@ class MainViewModel : ViewModel() {
                     }
                 }
             }
-
-            // Poll events only when monitoring is active
-            if (_monitoring.value == true) {
-                pollEventFile()
-            }
         } catch (e: Exception) {
             Log.e(TAG, "pollOnce error", e)
-        }
-    }
-
-    private suspend fun pollEventFile() {
-        val size = KpmBridge.eventFileSize()
-        if (size <= 0L) return
-
-        if (size < eventOffsetBytes) {
-            eventOffsetBytes = 0L
-            eventCarry = ""
-        }
-
-        if (size > eventRotateThresholdBytes) {
-            val rotated = KpmBridge.rotateEventFile()
-            if (rotated) {
-                eventOffsetBytes = 0L
-                eventCarry = ""
-                return
-            }
-        }
-
-        val chunk = KpmBridge.readEventFile(eventOffsetBytes)
-        if (chunk.isEmpty()) return
-        eventOffsetBytes += chunk.toByteArray(Charsets.UTF_8).size.toLong()
-
-        val merged = if (eventCarry.isNotEmpty()) eventCarry + chunk else chunk
-        val lines = merged.split('\n')
-        val complete = if (merged.endsWith("\n")) lines else lines.dropLast(1)
-        eventCarry = if (merged.endsWith("\n")) "" else lines.lastOrNull().orEmpty()
-
-        val parsed = ArrayList<StatusParser.SvcEvent>()
-        for (raw in complete) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            parsed.addAll(StatusParser.parseEventLines(line))
-        }
-        if (parsed.isEmpty()) return
-
-        synchronized(eventBuffer) {
-            eventBuffer.addAll(parsed)
-            while (eventBuffer.size > maxEvents) {
-                eventBuffer.removeAt(0)
-            }
-            _events.postValue(ArrayList(eventBuffer))
-            _eventCount.postValue(eventBuffer.size)
         }
     }
 
@@ -161,9 +127,6 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             pollingPaused = true
             try {
-                eventOffsetBytes = 0L
-                eventCarry = ""
-                KpmBridge.truncateEventFile()
                 synchronized(eventBuffer) {
                     eventBuffer.clear()
                     _events.postValue(emptyList())
@@ -207,9 +170,6 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             pollingPaused = true
             try {
-                eventOffsetBytes = 0L
-                eventCarry = ""
-                KpmBridge.truncateEventFile()
                 synchronized(eventBuffer) {
                     eventBuffer.clear()
                     _events.postValue(emptyList())

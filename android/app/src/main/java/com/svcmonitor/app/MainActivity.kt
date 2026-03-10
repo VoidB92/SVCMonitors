@@ -16,8 +16,11 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -49,6 +52,7 @@ class MainActivity : AppCompatActivity() {
 
     // Events tab
     private lateinit var tvEvtCount: TextView
+    private lateinit var etEventSearch: EditText
     private lateinit var llEventList: LinearLayout
     private lateinit var scrollEvents: ScrollView
 
@@ -67,6 +71,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var filterListContainer: LinearLayout
     private var hookedNrSet: Set<Int> = emptySet()
     private var currentNrList: List<Int> = emptyList()
+    private var lastEventsAll: List<StatusParser.SvcEvent> = emptyList()
+    private var eventSearchQuery: String = ""
+    private var historyLastSeq: Long = 0L
 
     /* ── app list data ────────────────────────────────────────── */
     private var appList: List<AppInfo> = emptyList()
@@ -94,6 +101,7 @@ class MainActivity : AppCompatActivity() {
         hideSystemApps = prefs.getBoolean("hide_system_apps", false)
         onlyLaunchableApps = prefs.getBoolean("only_launchable_apps", false)
         vm.doFilpOpenEnabled = prefs.getBoolean("do_filp_open", true)
+        historyLastSeq = prefs.getLong("history_last_seq", 0L)
         appList = loadVisibleApps(appSearchQuery)
 
         // Pre-build ALL tab views FIRST (before observeViewModel!)
@@ -475,6 +483,66 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(topBar)
 
+        val searchBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setBackgroundColor(Color.WHITE)
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        etEventSearch = EditText(this).apply {
+            hint = "搜索事件（字符串/数字）"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    eventSearchQuery = s?.toString()?.trim().orEmpty()
+                    updateEventList(filterEvents(lastEventsAll))
+                }
+            })
+        }
+        searchBar.addView(etEventSearch)
+
+        searchBar.addView(Button(this).apply {
+            text = "清除"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            isAllCaps = false
+            setOnClickListener {
+                etEventSearch.setText("")
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(4) }
+        })
+
+        searchBar.addView(Button(this).apply {
+            text = "历史"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            isAllCaps = false
+            setOnClickListener { shareHistory() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(4) }
+        })
+
+        searchBar.addView(Button(this).apply {
+            text = "清历史"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(cRed)
+            isAllCaps = false
+            setOnClickListener { clearHistory() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(4) }
+        })
+
+        root.addView(searchBar)
+
         // Event list in ScrollView
         scrollEvents = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -678,7 +746,9 @@ class MainActivity : AppCompatActivity() {
 
         // Events list
         vm.events.observe(this) { events ->
-            updateEventList(events)
+            lastEventsAll = events
+            persistNewEvents(events)
+            updateEventList(filterEvents(events))
         }
 
         // Toast
@@ -697,8 +767,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateEventList(events: List<StatusParser.SvcEvent>) {
         llEventList.removeAllViews()
 
-        // Show last 100 events in reverse chronological order
-        val display = events.take(100)
+        val display = events.takeLast(100).asReversed()
         if (display.isEmpty()) {
             llEventList.addView(TextView(this).apply {
                 text = "暂无事件。启动监控后事件将自动显示。"
@@ -768,6 +837,90 @@ class MainActivity : AppCompatActivity() {
             }
 
             llEventList.addView(card)
+        }
+    }
+
+    private fun filterEvents(events: List<StatusParser.SvcEvent>): List<StatusParser.SvcEvent> {
+        val q = eventSearchQuery.trim()
+        if (q.isEmpty()) return events
+        val lq = q.lowercase()
+        val out = ArrayList<StatusParser.SvcEvent>()
+        for (e in events) {
+            val hit =
+                e.name.lowercase().contains(lq) ||
+                    e.comm.lowercase().contains(lq) ||
+                    e.desc.lowercase().contains(lq) ||
+                    e.nr.toString().contains(q) ||
+                    e.pid.toString().contains(q) ||
+                    e.uid.toString().contains(q) ||
+                    e.seq.toString().contains(q)
+            if (hit) out.add(e)
+        }
+        return out
+    }
+
+    private fun historyFile(): File {
+        return File(filesDir, "events_history.jsonl")
+    }
+
+    private fun persistNewEvents(events: List<StatusParser.SvcEvent>) {
+        val maxSeq = events.maxOfOrNull { it.seq } ?: 0L
+        if (maxSeq < historyLastSeq) {
+            historyLastSeq = 0L
+        }
+        val newEvents = events.filter { it.seq > historyLastSeq }
+        if (newEvents.isEmpty()) return
+        historyLastSeq = newEvents.maxOf { it.seq }
+        prefs.edit().putLong("history_last_seq", historyLastSeq).apply()
+
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                val f = historyFile()
+                if (f.exists() && f.length() > 20L * 1024L * 1024L) {
+                    val bak = File(f.parentFile, "events_history.${System.currentTimeMillis()}.jsonl")
+                    f.renameTo(bak)
+                }
+                val sb = StringBuilder()
+                for (e in newEvents) {
+                    sb.append("{\"seq\":").append(e.seq)
+                        .append(",\"nr\":").append(e.nr)
+                        .append(",\"name\":\"").append(e.name.replace("\"", "\\\"")).append("\"")
+                        .append(",\"pid\":").append(e.pid)
+                        .append(",\"uid\":").append(e.uid)
+                        .append(",\"comm\":\"").append(e.comm.replace("\"", "\\\"")).append("\"")
+                        .append(",\"desc\":\"").append(e.desc.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")).append("\"")
+                        .append("}\n")
+                }
+                f.appendText(sb.toString())
+            }
+        }
+    }
+
+    private fun shareHistory() {
+        lifecycleScope.launch {
+            val src = historyFile()
+            if (!src.exists() || src.length() == 0L) {
+                tvMsg.text = "提示: 暂无历史日志"
+                return@launch
+            }
+            val dst = withContext(Dispatchers.IO) {
+                val out = File(cacheDir, "events_history.jsonl")
+                src.copyTo(out, overwrite = true)
+                out
+            }
+            shareFile(dst, "application/x-ndjson")
+        }
+    }
+
+    private fun clearHistory() {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                val f = historyFile()
+                if (f.exists()) f.delete()
+            }
+            historyLastSeq = 0L
+            prefs.edit().putLong("history_last_seq", 0L).apply()
+            tvMsg.text = "提示: 历史日志已清空"
         }
     }
 

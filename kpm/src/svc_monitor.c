@@ -52,6 +52,7 @@
 extern int (*kf_strcmp)(const char *cs, const char *ct);
 extern int (*kf_strncmp)(const char *cs, const char *ct, unsigned long count);
 extern unsigned long (*kf_strlen)(const char *s);
+extern long raw_syscall0(long nr);
 
 #define strcmp kfunc_def(strcmp)
 #define strncmp kfunc_def(strncmp)
@@ -1465,7 +1466,7 @@ static void push_event(int nr, int uid,
         svc_event_t *ev = &g_events[idx];
         ev->seq = ++g_seq;
         ev->nr = nr;
-        ev->pid = *(int *)((char *)current + task_struct_offset.pid_offset);
+        ev->pid = (int)raw_syscall0(__NR_getpid);
         ev->uid = uid;
         ev->a0 = a0; ev->a1 = a1; ev->a2 = a2;
         ev->a3 = a3; ev->a4 = a4; ev->a5 = a5;
@@ -1905,12 +1906,27 @@ static int parse_int(const char *s, int *consumed)
  * ================================================================ */
 static int write_output_file(const char *data, int len)
 {
-    long fd;
-    fd = raw_syscall4(__NR_openat, -100, (long)OUTPUT_PATH,
-                      0x241, 0644);
-    if (fd < 0) return -1;
-    raw_syscall3(__NR_write, fd, (long)data, len);
-    raw_syscall1(__NR_close, fd);
+    loff_t pos = 0;
+    struct file *fp;
+    if (!data || len <= 0) return -1;
+    if (!kallsyms_lookup_name) return -1;
+
+    if (!g_filp_open)
+        g_filp_open = (typeof(g_filp_open))kallsyms_lookup_name("filp_open");
+    if (!g_filp_close)
+        g_filp_close = (typeof(g_filp_close))kallsyms_lookup_name("filp_close");
+    if (!g_kernel_write) {
+        g_kernel_write = (typeof(g_kernel_write))kallsyms_lookup_name("kernel_write");
+        if (!g_kernel_write)
+            g_kernel_write = (typeof(g_kernel_write))kallsyms_lookup_name("__kernel_write");
+    }
+
+    if (!g_filp_open || !g_filp_close || !g_kernel_write) return -1;
+
+    fp = g_filp_open(OUTPUT_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (!fp || IS_ERR(fp)) return -1;
+    g_kernel_write(fp, data, (unsigned long)len, &pos);
+    g_filp_close(fp, 0);
     return 0;
 }
 

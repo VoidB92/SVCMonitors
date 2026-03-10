@@ -24,6 +24,7 @@ object KpmBridge {
     private const val TAG = "KpmBridge"
     private const val KPATCH = "/data/adb/ap/bin/kpatch"
     private const val MODULE = "svc_monitor"
+    private const val OUT_FILE = "/data/local/tmp/svc_out.json"
     private const val EVENT_FILE = "/data/local/tmp/svc_events.jsonl"
     private var superKey = "XiaoLu0129"
     private val mutex = Mutex()
@@ -136,7 +137,37 @@ object KpmBridge {
     suspend fun tier2(on: Boolean) = execute("tier2 ${if (on) "on" else "off"}")
 
     // ===== Events =====
-    suspend fun drain(max: Int = 100) = execute("drain $max")
+    suspend fun drain(max: Int = 1024): KpmResult = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            try {
+                val shellCmd = "$KPATCH $superKey kpm ctl0 $MODULE 'drain $max'"
+                val (exitCode, directOutput) = shellExec(shellCmd)
+
+                delay(80)
+
+                val (_, fileOutput) = shellExec("cat $OUT_FILE 2>/dev/null")
+                val output = if (fileOutput.isNotEmpty()) fileOutput else directOutput
+
+                if (output.isNotEmpty()) {
+                    val simple = StatusParser.parseSimple(output)
+                    if (simple.ok) {
+                        Log.d(TAG, "drain($max) OK: ${output.take(200)}")
+                        KpmResult(true, output)
+                    } else {
+                        Log.w(TAG, "drain($max) FAIL: ${simple.error}")
+                        KpmResult(false, output, simple.error)
+                    }
+                } else {
+                    val errMsg = "exit=$exitCode, no output"
+                    Log.w(TAG, "drain($max) FAIL: $errMsg")
+                    KpmResult(false, "", errMsg)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "drain($max) exception", e)
+                KpmResult(false, "", e.message ?: "Unknown error")
+            }
+        }
+    }
     suspend fun events() = execute("events")
     suspend fun clear() = execute("clear")
 

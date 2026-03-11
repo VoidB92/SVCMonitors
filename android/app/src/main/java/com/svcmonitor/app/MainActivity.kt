@@ -913,7 +913,15 @@ class MainActivity : AppCompatActivity() {
         val lq = q.lowercase()
         val out = ArrayList<StatusParser.SvcEvent>()
         for (e in events) {
-            val extra = eventSearchExtra[e.seq]?.lowercase().orEmpty()
+            val extra = buildString {
+                eventSearchExtra[e.seq]?.let { append(it.lowercase()) }
+                eventCallChain[e.seq]?.let { if (isNotEmpty()) append('\n'); append(it.lowercase()) }
+                if (e.bt.isNotEmpty()) {
+                    if (isNotEmpty()) append('\n')
+                    append("bt_raw:")
+                    e.bt.forEach { append(" 0x").append(java.lang.Long.toHexString(it)) }
+                }
+            }
             val hit =
                 e.name.lowercase().contains(lq) ||
                     e.comm.lowercase().contains(lq) ||
@@ -1078,81 +1086,89 @@ class MainActivity : AppCompatActivity() {
         if (resolvingSearch) return
         val q = eventSearchQuery.trim()
         if (q.isEmpty()) return
-        val snapshot = lastEventsAll.takeLast(600)
+        val snapshot = lastEventsAll
         if (snapshot.isEmpty()) return
         if (snapshot.all { eventSearchExtra.containsKey(it.seq) }) return
 
         resolvingSearch = true
         lifecycleScope.launch {
             try {
-                val batch = snapshot.filter { !eventSearchExtra.containsKey(it.seq) }.take(80)
-                for (e in batch) {
-                    val pcResolved = formatAddrSoOffset(e.pid, e.pc)
-                    val callerResolved = formatAddrSoOffset(e.pid, e.caller)
-                    val cloneResolved = if (e.cloneFn != 0L) formatAddrSoOffset(e.pid, e.cloneFn) else ""
-                    val fdResolved = if (nrUsesFd(e.nr)) {
-                        val r = KpmBridge.readProcFdLink(e.pid, e.a0)
-                        if (r.isNotBlank()) r else ""
-                    } else {
-                        ""
-                    }
-                    val chainResolved = buildFpCallChain(e, callerResolved)
-                    if (chainResolved.isNotBlank()) eventCallChain[e.seq] = chainResolved
-                    val kernelBtResolved = if (e.bt.isNotEmpty()) {
-                        buildString {
-                            var idx = 0
-                            for (a in e.bt) {
-                                if (a == 0L) continue
-                                appendLine("#$idx ${formatAddrSoOffset(e.pid, a)}")
-                                idx++
-                                if (idx >= 7) break
-                            }
-                        }.trim()
-                    } else {
-                        ""
-                    }
+                val pending = snapshot.filter { !eventSearchExtra.containsKey(it.seq) }
+                for (chunk in pending.chunked(200)) {
+                    for (e in chunk) {
+                        val pcResolved = formatAddrSoOffset(e.pid, e.pc)
+                        val callerResolved = formatAddrSoOffset(e.pid, e.caller)
+                        val cloneResolved = if (e.cloneFn != 0L) formatAddrSoOffset(e.pid, e.cloneFn) else ""
+                        val fdResolved = if (nrUsesFd(e.nr)) {
+                            val r = KpmBridge.readProcFdLink(e.pid, e.a0)
+                            if (r.isNotBlank()) r else ""
+                        } else {
+                            ""
+                        }
+                        val chainResolved = buildFpCallChain(e, callerResolved)
+                        if (chainResolved.isNotBlank()) eventCallChain[e.seq] = chainResolved
+                        val kernelBtResolved = if (e.bt.isNotEmpty()) {
+                            buildString {
+                                var idx = 0
+                                for (a in e.bt) {
+                                    if (a == 0L) continue
+                                    appendLine("#$idx ${formatAddrSoOffset(e.pid, a)}")
+                                    idx++
+                                    if (idx >= 7) break
+                                }
+                            }.trim()
+                        } else {
+                            ""
+                        }
 
-                    val blob = buildString {
-                        appendLine("#${e.seq}  ${e.name}(${e.nr})")
-                        appendLine("分类: ${StatusParser.syscallCategory(e.nr)}")
-                        appendLine("PID: ${e.pid}  UID: ${e.uid}")
-                        appendLine("进程名: ${e.comm}")
-                        appendLine()
-                        appendLine("pc: $pcResolved")
-                        appendLine("caller: $callerResolved")
-                        if (kernelBtResolved.isNotBlank()) {
+                        val blob = buildString {
+                            appendLine("#${e.seq}  ${e.name}(${e.nr})")
+                            appendLine("分类: ${StatusParser.syscallCategory(e.nr)}")
+                            appendLine("PID: ${e.pid}  UID: ${e.uid}")
+                            appendLine("进程名: ${e.comm}")
                             appendLine()
-                            appendLine("bt:")
-                            appendLine(kernelBtResolved)
-                        }
-                        if (e.cloneFn != 0L) appendLine("clone_fn: $cloneResolved")
-                        if (fdResolved.isNotEmpty()) appendLine("fd(${e.a0}): $fdResolved")
-                        if (chainResolved.isNotBlank()) {
+                            appendLine("pc: $pcResolved")
+                            appendLine("caller: $callerResolved")
+                            if (kernelBtResolved.isNotBlank()) {
+                                appendLine()
+                                appendLine("bt:")
+                                appendLine(kernelBtResolved)
+                            }
+                            if (e.cloneFn != 0L) appendLine("clone_fn: $cloneResolved")
+                            if (fdResolved.isNotEmpty()) appendLine("fd(${e.a0}): $fdResolved")
+                            if (chainResolved.isNotBlank()) {
+                                appendLine()
+                                appendLine("调用链:")
+                                appendLine(chainResolved)
+                            }
+                            if (e.bt.isNotEmpty()) {
+                                appendLine()
+                                append("bt_raw:")
+                                e.bt.forEach { append(" 0x").append(java.lang.Long.toHexString(it)) }
+                                appendLine()
+                            }
                             appendLine()
-                            appendLine("调用链:")
-                            appendLine(chainResolved)
-                        }
-                        appendLine()
-                        appendLine("a0: 0x${java.lang.Long.toHexString(e.a0)} (${e.a0})")
-                        appendLine("a1: 0x${java.lang.Long.toHexString(e.a1)} (${e.a1})")
-                        appendLine("a2: 0x${java.lang.Long.toHexString(e.a2)} (${e.a2})")
-                        appendLine("a3: 0x${java.lang.Long.toHexString(e.a3)} (${e.a3})")
-                        appendLine("a4: 0x${java.lang.Long.toHexString(e.a4)} (${e.a4})")
-                        appendLine("a5: 0x${java.lang.Long.toHexString(e.a5)} (${e.a5})")
-                        appendLine()
-                        appendLine(e.desc)
+                            appendLine("a0: 0x${java.lang.Long.toHexString(e.a0)} (${e.a0})")
+                            appendLine("a1: 0x${java.lang.Long.toHexString(e.a1)} (${e.a1})")
+                            appendLine("a2: 0x${java.lang.Long.toHexString(e.a2)} (${e.a2})")
+                            appendLine("a3: 0x${java.lang.Long.toHexString(e.a3)} (${e.a3})")
+                            appendLine("a4: 0x${java.lang.Long.toHexString(e.a4)} (${e.a4})")
+                            appendLine("a5: 0x${java.lang.Long.toHexString(e.a5)} (${e.a5})")
+                            appendLine()
+                            appendLine(e.desc)
 
-                        val addrs = extractHexAddrs(e.desc).take(8)
-                        if (addrs.isNotEmpty()) {
-                            appendLine()
-                            addrs.forEach { a ->
-                                val abs = "0x${java.lang.Long.toHexString(a)}"
-                                val so = resolveAddress(e.pid, a)
-                                appendLine(if (so.isNotEmpty()) "$abs -> $so" else "$abs -> unmapped")
+                            val addrs = extractHexAddrs(e.desc).take(8)
+                            if (addrs.isNotEmpty()) {
+                                appendLine()
+                                addrs.forEach { a ->
+                                    val abs = "0x${java.lang.Long.toHexString(a)}"
+                                    val so = resolveAddress(e.pid, a)
+                                    appendLine(if (so.isNotEmpty()) "$abs -> $so" else "$abs -> unmapped")
+                                }
                             }
                         }
+                        eventSearchExtra[e.seq] = blob
                     }
-                    eventSearchExtra[e.seq] = blob
                 }
             } finally {
                 resolvingSearch = false

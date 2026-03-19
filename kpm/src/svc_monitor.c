@@ -187,12 +187,18 @@ static const char *syscall_names[] = {
 };
 #define SYSCALL_NAME_MAX 292
 
+typedef struct {
+    const char *name;
+    unsigned long addr;
+} kp_sysname_t;
+static kp_sysname_t *g_syscall_name_table = 0;
+
 static const char *get_syscall_name(int nr)
 {
     if (nr == 435) return "clone3";
     if (nr == -1) return "do_filp_open";
-    if (nr >= 0 && nr < 460) {
-        const char *n = syscall_name_table[nr].name;
+    if (nr >= 0 && nr < 460 && g_syscall_name_table) {
+        const char *n = g_syscall_name_table[nr].name;
         if (n && n[0]) return n;
     }
     if (nr >= 0 && nr < SYSCALL_NAME_MAX && syscall_names[nr])
@@ -219,6 +225,17 @@ typedef struct {
     unsigned long count;
 } read_ctx_t;
 static read_ctx_t g_read_ctx[READ_CTX_SLOTS];
+
+/* clone returns new tid; clone_fn (best-effort) is from user wrapper. Cache entry args by TID. */
+#define CLONE_CTX_SLOTS 2048
+typedef struct {
+    int pid;
+    int tgid;
+    unsigned long flags_or_uargs;
+    unsigned long stack_or_size;
+    unsigned long clone_fn;
+} clone_ctx_t;
+static clone_ctx_t g_clone_ctx[CLONE_CTX_SLOTS];
 
 /* Hook tracking */
 #define HOOK_INLINE  1
@@ -367,6 +384,9 @@ static int init_events_storage(void)
     if (!g_copy_from_user) {
         g_copy_from_user = (typeof(g_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
         if (!g_copy_from_user) g_copy_from_user = (typeof(g_copy_from_user))kallsyms_lookup_name("copy_from_user");
+    }
+    if (!g_syscall_name_table) {
+        g_syscall_name_table = (kp_sysname_t *)kallsyms_lookup_name("syscall_name_table");
     }
 
     if (!g_vfree) return -1;
@@ -1614,6 +1634,21 @@ static void describe_args(int nr, unsigned long a0, unsigned long a1,
         n = snprintf(desc, dlen, "buf=0x%lx count=%lu flags=0x%lx", a0, a1, a2);
         break;
 
+    case 101: /* nanosleep */
+        {
+            struct __ts {
+                long tv_sec;
+                long tv_nsec;
+            } ts;
+            memzero(&ts, sizeof(ts));
+            if (a0 && safe_copy_user_bytes((char *)&ts, a0, (int)sizeof(ts)) == (int)sizeof(ts)) {
+                n = snprintf(desc, dlen, "req=%ld.%09ld rem=0x%lx", ts.tv_sec, ts.tv_nsec, a1);
+            } else {
+                n = snprintf(desc, dlen, "req=0x%lx rem=0x%lx", a0, a1);
+            }
+        }
+        break;
+
     default:
         n = snprintf(desc, dlen, "a0=0x%lx a1=0x%lx a2=0x%lx a3=0x%lx a4=0x%lx a5=0x%lx",
                      a0, a1, a2, a3, a4, a5);
@@ -1758,6 +1793,13 @@ static void before_generic(hook_fargs4_t *args, void *udata)
     /* Build detailed description */
     describe_args(nr, a0, a1, a2, a3, a4, a5, desc, sizeof(desc));
 
+    if ((nr == __NR_clone || nr == 435) && clone_fn) {
+        int n = (int)strlen(desc);
+        if (n < (int)sizeof(desc) - 32) {
+            n += snprintf(desc + n, (int)sizeof(desc) - n, " fn=0x%lx", strip_ptr(clone_fn));
+        }
+    }
+
     if (nr == __NR_read) {
         unsigned int tid = (unsigned int)raw_syscall0(__NR_gettid);
         unsigned int tgid = (unsigned int)raw_syscall0(__NR_getpid);
@@ -1768,6 +1810,17 @@ static void before_generic(hook_fargs4_t *args, void *udata)
         g_read_ctx[slot].buf = strip_ptr(a1);
         g_read_ctx[slot].count = a2;
         return;
+    }
+
+    if (nr == __NR_clone || nr == 435) {
+        unsigned int tid = (unsigned int)raw_syscall0(__NR_gettid);
+        unsigned int tgid = (unsigned int)raw_syscall0(__NR_getpid);
+        unsigned int slot = (tid * 2654435761u) & (CLONE_CTX_SLOTS - 1);
+        g_clone_ctx[slot].pid = (int)tid;
+        g_clone_ctx[slot].tgid = (int)tgid;
+        g_clone_ctx[slot].flags_or_uargs = a0;
+        g_clone_ctx[slot].stack_or_size = a1;
+        g_clone_ctx[slot].clone_fn = strip_ptr(clone_fn);
     }
 
     push_event(nr, uid, a0, a1, a2, a3, a4, a5, pc, caller, fp, sp, bt_depth, bt, clone_fn, 0, desc);
@@ -1965,6 +2018,10 @@ static hook_entry_t tier2_hooks[] = {
 };
 #define TIER2_COUNT (sizeof(tier2_hooks) / sizeof(tier2_hooks[0]))
 
+static hook_entry_t dyn_hooks[460];
+
+static int install_hook(hook_entry_t *h);
+
 static int is_hooked_nr(int nr)
 {
     int i;
@@ -1974,6 +2031,24 @@ static int is_hooked_nr(int nr)
     for (i = 0; i < (int)TIER2_COUNT; i++) {
         if (tier2_hooks[i].nr == nr && tier2_hooks[i].active) return 1;
     }
+    if (nr >= 0 && nr < 460 && dyn_hooks[nr].active) return 1;
+    return 0;
+}
+
+static int ensure_hooked_nr(int nr)
+{
+    if (nr < 0 || nr >= 460) return 0;
+    if (is_hooked_nr(nr)) return 1;
+    if (dyn_hooks[nr].nr != nr) dyn_hooks[nr].nr = nr;
+    dyn_hooks[nr].active = 0;
+    dyn_hooks[nr].method = 0;
+    {
+        int narg;
+        for (narg = 6; narg >= 0; narg--) {
+            dyn_hooks[nr].narg = narg;
+            if (install_hook(&dyn_hooks[nr]) == 0) return 1;
+        }
+    }
     return 0;
 }
 
@@ -1982,18 +2057,64 @@ static void after_clone_ret(hook_fargs0_t *args, void *udata)
     int nr = (int)(unsigned long)udata;
     long ret = (long)args->ret;
     int uid;
+    unsigned int tid;
+    unsigned int tgid;
+    unsigned int slot;
+    unsigned long flags_or_uargs = 0;
+    unsigned long stack_or_size = 0;
+    unsigned long clone_fn = 0;
+    unsigned long pc = 0;
+    unsigned long caller = 0;
+    unsigned long fp = 0;
+    unsigned long sp = 0;
+    unsigned long bt[MAX_BT];
+    unsigned int bt_depth = 0;
+    char desc[DESC_BUF_SIZE];
+    int n = 0;
     if (!g_enabled) return;
     if (ret <= 0) return;
     uid = (int)current_uid();
     if (g_target_uid >= 0 && uid != g_target_uid) return;
+    if (nr != __NR_clone && nr != 435) return;
+    if (!bitmap_test(g_nr_bitmap, nr)) return;
+
+    tid = (unsigned int)raw_syscall0(__NR_gettid);
+    tgid = (unsigned int)raw_syscall0(__NR_getpid);
+    slot = (tid * 2654435761u) & (CLONE_CTX_SLOTS - 1);
+    if (g_clone_ctx[slot].pid == (int)tid && g_clone_ctx[slot].tgid == (int)tgid) {
+        flags_or_uargs = g_clone_ctx[slot].flags_or_uargs;
+        stack_or_size = g_clone_ctx[slot].stack_or_size;
+        clone_fn = g_clone_ctx[slot].clone_fn;
+    }
+
+    {
+        struct pt_regs *r = _task_pt_reg(current);
+        if (r) {
+            pc = (unsigned long)r->pc;
+            caller = (unsigned long)r->regs[30];
+            fp = (unsigned long)r->regs[29];
+            sp = (unsigned long)r->sp;
+            memzero(bt, sizeof(bt));
+            bt_depth = unwind_user_fp(r, bt);
+        }
+    }
+
+    if (nr == __NR_clone) {
+        n = snprintf(desc, sizeof(desc), "new_tid=%ld flags=0x%lx stack=0x%lx",
+                     ret, flags_or_uargs, strip_ptr(stack_or_size));
+        if (clone_fn) n += snprintf(desc + n, (int)sizeof(desc) - n, " fn=0x%lx", clone_fn);
+    } else {
+        n = snprintf(desc, sizeof(desc), "new_tid=%ld uargs=0x%lx size=%lu",
+                     ret, strip_ptr(flags_or_uargs), stack_or_size);
+    }
 
     push_event(nr, uid,
-               0, 0, 0, 0, 0, 0,
-               0, 0, 0, 0,
-               0, 0,
-               0,
+               flags_or_uargs, stack_or_size, 0, 0, 0, 0,
+               pc, caller, fp, sp,
+               bt_depth, bt,
+               clone_fn,
                (unsigned long)ret,
-               "clone_ret");
+               desc);
 }
 
 static void after_read_ret(hook_fargs0_t *args, void *udata)
@@ -2629,10 +2750,32 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
                 first = 0;
             }
         }
+        for (i = 0; i < 460; i++) {
+            if (dyn_hooks[i].active) {
+                if (!first) n += snprintf(buf + n, blen - n, ",");
+                n += snprintf(buf + n, blen - n, "{\"nr\":%d,\"name\":\"%s\",\"method\":\"%s\"}",
+                    dyn_hooks[i].nr, get_syscall_name(dyn_hooks[i].nr),
+                    dyn_hooks[i].method == HOOK_INLINE ? "inline" : "fp");
+                first = 0;
+            }
+        }
         if (g_do_filp_open_active) {
             if (!first) n += snprintf(buf + n, blen - n, ",");
             n += snprintf(buf + n, blen - n, "{\"nr\":-1,\"name\":\"do_filp_open\",\"method\":\"inline\"}");
             first = 0;
+        }
+        n += snprintf(buf + n, blen - n, "]}");
+    }
+
+    /* ---- sysnames ---- */
+    else if (!strcmp(args, "sysnames")) {
+        int i;
+        n = snprintf(buf, blen, "{\"ok\":true,\"sysnames\":[");
+        for (i = 0; i < 460; i++) {
+            const char *nm = get_syscall_name(i);
+            if (nm && !strncmp(nm, "sys_", 4)) nm += 4;
+            if (i) n += snprintf(buf + n, blen - n, ",");
+            n += snprintf(buf + n, blen - n, "{\"nr\":%d,\"name\":\"%s\"}", i, nm ? nm : "");
         }
         n += snprintf(buf + n, blen - n, "]}");
     }
@@ -2658,11 +2801,11 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
     /* ---- enable_nr <n> ---- */
     else if (!strncmp(args, "enable_nr ", 10)) {
         int nr = parse_int(args + 10, 0);
-        if (is_hooked_nr(nr)) {
+        if (ensure_hooked_nr(nr)) {
             bitmap_set(g_nr_bitmap, nr);
             n = snprintf(buf, blen, "{\"ok\":true,\"enabled_nr\":%d}", nr);
         } else {
-            n = snprintf(buf, blen, "{\"ok\":false,\"error\":\"nr_not_hooked\",\"nr\":%d}", nr);
+            n = snprintf(buf, blen, "{\"ok\":false,\"error\":\"nr_hook_failed\",\"nr\":%d}", nr);
         }
     }
 
@@ -2687,7 +2830,7 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
             int consumed = 0;
             int nr = parse_int(p, &consumed);
             if (consumed > 0) {
-                if (is_hooked_nr(nr)) {
+                if (ensure_hooked_nr(nr)) {
                     bitmap_set(g_nr_bitmap, nr);
                     cnt++;
                 } else {
@@ -2708,6 +2851,8 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
             if (tier1_hooks[i].active) bitmap_set(g_nr_bitmap, tier1_hooks[i].nr);
         for (i = 0; i < (int)TIER2_COUNT; i++)
             if (tier2_hooks[i].active) bitmap_set(g_nr_bitmap, tier2_hooks[i].nr);
+        for (i = 0; i < 460; i++)
+            if (dyn_hooks[i].active) bitmap_set(g_nr_bitmap, dyn_hooks[i].nr);
         n = snprintf(buf, blen, "{\"ok\":true}");
     }
 
@@ -2849,6 +2994,7 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
 static long svc_init(const char *args, const char *event, void *__user reserved)
 {
     int ok;
+    int i;
     printk("svc_monitor v8.1.0: init, installing hooks...\n");
 
     g_enabled = 0;
@@ -2862,6 +3008,13 @@ static long svc_init(const char *args, const char *event, void *__user reserved)
     g_hooks_installed = 0;
     g_tier2_loaded = 0;
     g_active = 0;
+
+    for (i = 0; i < 460; i++) {
+        dyn_hooks[i].nr = i;
+        dyn_hooks[i].narg = 6;
+        dyn_hooks[i].active = 0;
+        dyn_hooks[i].method = 0;
+    }
 
     if (init_events_storage() != 0) {
         printk("svc_monitor: init_events_storage failed\n");
@@ -2904,6 +3057,10 @@ static long svc_exit(void *__user reserved)
         for (i = 0; i < (int)TIER2_COUNT; i++)
             remove_hook(&tier2_hooks[i]);
         g_tier2_loaded = 0;
+    }
+
+    for (i = 0; i < 460; i++) {
+        if (dyn_hooks[i].active) remove_hook(&dyn_hooks[i]);
     }
 
     for (i = 0; i < (int)TIER1_COUNT; i++)

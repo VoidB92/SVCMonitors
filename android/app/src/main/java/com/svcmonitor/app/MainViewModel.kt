@@ -68,6 +68,7 @@ class MainViewModel : ViewModel() {
     private var pollingPaused = false
 
     private val nrSet = mutableSetOf<Int>()
+    private var sysnamesLoaded = false
     private var statusTick = 0
 
     private var dao: SvcEventDao? = null
@@ -160,6 +161,12 @@ class MainViewModel : ViewModel() {
             val statusResult = KpmBridge.status()
             if (statusResult.success && statusResult.output.isNotEmpty()) {
                 val s = StatusParser.parseStatus(statusResult.output)
+                if (!sysnamesLoaded && s.ok) {
+                    val r = KpmBridge.sysnames()
+                    if (r.success && r.output.isNotEmpty()) {
+                        sysnamesLoaded = StatusParser.parseSysnames(r.output)
+                    }
+                }
                 _status.postValue(s)
                 if (s.ok) {
                     _monitoring.postValue(s.enabled)

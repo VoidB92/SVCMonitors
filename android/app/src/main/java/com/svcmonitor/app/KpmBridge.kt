@@ -207,6 +207,9 @@ object KpmBridge {
     /** Get module status */
     suspend fun status() = execute("status")
 
+    /** Get syscall name table (0-459) */
+    suspend fun sysnames() = execute("sysnames")
+
     // ===== Filter control =====
 
     /** Set target UID (-1 for all) */

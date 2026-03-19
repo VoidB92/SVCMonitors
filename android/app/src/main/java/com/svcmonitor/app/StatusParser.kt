@@ -357,4 +357,23 @@ object StatusParser {
             }
         }
     }
+
+    fun parseSysnames(raw: String): Boolean {
+        return try {
+            val root = JSONObject(raw)
+            if (!root.optBoolean("ok", false)) return false
+            val arr = root.optJSONArray("sysnames") ?: return false
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val nr = o.optInt("nr", -1)
+                val name = o.optString("name", "")
+                if (nr >= 0 && name.isNotBlank()) {
+                    dynamicNrNameMap[nr] = name.removePrefix("sys_")
+                }
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
 }

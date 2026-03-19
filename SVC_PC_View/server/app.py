@@ -75,6 +75,11 @@ def normalize_event(ev):
     if "ret" in out and "retval" not in out:
         out["retval"] = out.get("ret")
 
+    if "name" in out and isinstance(out.get("name"), str):
+        nm = out.get("name") or ""
+        if nm.startswith("sys_"):
+            out["name"] = nm[4:]
+
     if "tid" not in out:
         out["tid"] = out.get("pid", 0)
 

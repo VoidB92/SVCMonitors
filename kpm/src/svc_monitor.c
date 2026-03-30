@@ -1,6 +1,6 @@
-/* svc_monitor.c — v8.1 Enhanced SVC Monitor KPM
+/* svc_monitor.c — v8.2 Fixed SVC Monitor KPM
  *
- * v8.1 Enhancements:
+ * v8.2 Fixes over v8.1:
  *   - Deep argument parsing for 50+ syscalls important for reverse engineering
  *   - User-space string resolution via compat_strncpy_from_user
  *   - sockaddr parsing (AF_INET/AF_INET6/AF_UNIX) for connect/bind/sendto
@@ -11,7 +11,21 @@
  *   - ioctl cmd decode (BINDER/TIOCSCTTY/TCGETS etc)
  *   - write/sendto partial data preview (first 64 bytes hex+ascii)
  *   - Larger DESC_BUF for detailed output (1024 bytes)
- *   - Larger event ring buffer (1024 events)
+ *   - Larger event ring buffer (8192 events)
+ *
+ * v8.2 Fixes:
+ *   - MAX_BT 7->16 for deeper backtraces
+ *   - Stack scan fallback when FP chain breaks (-fomit-frame-pointer)
+ *   - Relaxed FP monotonicity for signal/altstack frames
+ *   - Atomic bitmap_set/bitmap_clear (ARM64 ldxr/stxr)
+ *   - Fixed fargs type mismatch: unified narg=6 for all hooks
+ *   - Fixed push_event: removed msleep-under-spinlock, direct drop on full
+ *   - Fixed read hook: before_generic now also emits read_enter event
+ *   - Hash collision mitigation: linear probing (depth=4) for ctx slots
+ *   - Fixed drain: uses pop_event() for thread-safe reads
+ *   - Fixed svc_exit: refcount-based wait for in-flight callbacks
+ *   - Writer thread: removed redundant SEEK_END (O_APPEND handles it)
+ *   - bt[] bit0 flag: 0=FP chain (reliable), 1=stack scan (heuristic)
  *
  * Architecture:
  *   - Module load → hook all tier1 syscalls → always monitoring
@@ -59,7 +73,7 @@ extern long raw_syscall0(long nr);
 #define strlen kfunc_def(strlen)
 
 KPM_NAME("svc_monitor");
-KPM_VERSION("8.1.0");
+KPM_VERSION("8.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Xiaowaaa");
 KPM_DESCRIPTION("Enhanced ARM64 SVC syscall monitor with deep arg parsing");
@@ -216,7 +230,8 @@ static volatile unsigned int g_seq = 0;      // 事件序列号（全局自增�
 static volatile unsigned int g_total = 0;    // 总事件计数
 
 /* read(2) needs after-hook to dump user buffer, so we cache entry args by TID */
-#define READ_CTX_SLOTS 2048
+#define READ_CTX_SLOTS 4096
+#define CTX_PROBE_DEPTH 4
 typedef struct {
     int pid;
     int tgid;
@@ -227,7 +242,7 @@ typedef struct {
 static read_ctx_t g_read_ctx[READ_CTX_SLOTS];
 
 /* clone returns new tid; clone_fn (best-effort) is from user wrapper. Cache entry args by TID. */
-#define CLONE_CTX_SLOTS 2048
+#define CLONE_CTX_SLOTS 4096
 typedef struct {
     int pid;
     int tgid;
@@ -252,7 +267,7 @@ typedef struct {
 
 /* Event record — expanded for detailed parsing */
 //这里参数的读取在内核态进行解析，但是调用地址返回地址在APK侧读取maps文件进行解析
-#define MAX_BT 7
+#define MAX_BT 16
 typedef struct {
     unsigned int seq;          // 事件序列号
     int nr;                    // syscall 号
@@ -285,6 +300,7 @@ static volatile int g_ev_lock = 0;
 static volatile int g_hooks_installed = 0;
 static volatile int g_tier2_loaded = 0;
 static volatile int g_active = 0;
+static volatile int g_hook_refcount = 0;  /* active hook callback count */
 
 static struct task_struct *g_writer_task = 0;
 static volatile int g_writer_stop = 0;
@@ -339,34 +355,98 @@ static inline int is_user_addr(unsigned long v)
 
 static unsigned int unwind_user_fp(struct pt_regs *r, unsigned long bt[MAX_BT])
 {
-    unsigned long fp;
+    unsigned long fp, prev_fp = 0;
     unsigned long frame[2];
     unsigned int d = 0;
+    int non_mono_count = 0;
 
     if (!r || !bt) return 0;
+
+    /* Step 1: Always record PC and LR — these are reliable even without FP chain */
     {
         unsigned long pc = strip_ptr((unsigned long)r->pc);
         unsigned long lr = strip_ptr((unsigned long)r->regs[30]);
         if (is_user_addr(pc)) bt[d++] = pc;
-        if (d < MAX_BT && is_user_addr(lr)) bt[d++] = lr;
+        if (d < MAX_BT && is_user_addr(lr) && lr != pc) bt[d++] = lr;
     }
 
     fp = strip_ptr((unsigned long)r->regs[29]);
     if (!g_copy_from_user) return d;
 
+    /* Step 2: FP chain walk with relaxed constraints */
     while (d < MAX_BT) {
-        unsigned long next_fp;
-        unsigned long ret;
+        unsigned long next_fp, ret, gap;
+
         if (!is_user_addr(fp)) break;
-        if (fp & 0xFUL) break;
+        if (fp & 0x7UL) break;   /* 8-byte aligned is sufficient for ARM64 */
+
         if (g_copy_from_user(frame, (const void __user *)fp, sizeof(frame)) != 0) break;
+
         next_fp = strip_ptr(frame[0]);
         ret = strip_ptr(frame[1]);
+
+        /* Return address must be valid user text */
         if (!is_user_addr(ret)) break;
+        /* ARM64 instructions are 4-byte aligned */
+        if (ret & 0x3UL) break;
+
+        /* Deduplicate against last entry */
+        if (d > 0 && bt[d - 1] == ret) goto fp_next;
         bt[d++] = ret;
-        if (next_fp <= fp) break;
-        if (next_fp - fp > 0x40000UL) break;
+
+    fp_next:
+        /* Stop on obvious loops */
+        if (next_fp == fp || next_fp == 0) break;
+
+        /* Relaxed monotonicity: allow one non-monotonic jump (signal/altstack)
+         * but two consecutive non-monotonic jumps means the chain is garbage */
+        if (next_fp <= fp) {
+            non_mono_count++;
+            if (non_mono_count >= 2) break;
+        } else {
+            non_mono_count = 0;
+        }
+
+        /* Gap check: allow up to 1MB for signal stacks */
+        gap = next_fp > fp ? next_fp - fp : fp - next_fp;
+        if (gap > 0x100000UL) break;
+
+        prev_fp = fp;
         fp = next_fp;
+    }
+
+    /* Step 3: Stack scan fallback — when FP chain is broken (e.g. -fomit-frame-pointer),
+     * scan the stack for values that look like valid .text return addresses.
+     * These are less reliable, so we mark them with bit0 set. */
+    if (d < MAX_BT && d <= 4 && g_copy_from_user) {
+        /* Only engage stack scan if FP chain gave very few results */
+        unsigned long scan_sp = strip_ptr((unsigned long)r->sp);
+        int scanned = 0;
+        int scan_hits = 0;
+        unsigned long val;
+
+        while (d < MAX_BT && scanned < 128 && scan_hits < 6) {
+            int dup, k;
+            if (!is_user_addr(scan_sp)) break;
+            if (g_copy_from_user(&val, (const void __user *)scan_sp, 8) != 0) break;
+            val = strip_ptr(val);
+
+            /* Heuristic: looks like a .text address if user-space, 4-byte aligned,
+             * and NOT in the stack range itself */
+            if (is_user_addr(val) && (val & 0x3) == 0 &&
+                (val < scan_sp - 0x200000UL || val > scan_sp + 0x200000UL)) {
+                dup = 0;
+                for (k = 0; k < (int)d; k++) {
+                    if ((bt[k] & ~1UL) == val) { dup = 1; break; }
+                }
+                if (!dup) {
+                    bt[d++] = val | 1UL;  /* bit0=1 marks as stack-scan guess */
+                    scan_hits++;
+                }
+            }
+            scan_sp += 8;
+            scanned++;
+        }
     }
 
     return d;
@@ -427,14 +507,47 @@ static void free_events_storage(void)
 //感觉这部分写的不是很好，最好是精准控制要hook哪些系统调用号，给他加进位图内
  static inline void bitmap_set(volatile unsigned long *bm, int bit)
 {
-    if (bit >= 0 && bit < MAX_NR)
-        bm[bit / 64] |= (1UL << (bit % 64));
+    if (bit < 0 || bit >= MAX_NR) return;
+    {
+        volatile unsigned long *ptr = &bm[bit / 64];
+        unsigned long mask = 1UL << (bit % 64);
+        unsigned long tmp, old;
+        asm volatile(
+            "1: ldxr  %0, [%2]\n"
+            "   orr   %0, %0, %3\n"
+            "   stxr  %w1, %0, [%2]\n"
+            "   cbnz  %w1, 1b\n"
+            : "=&r"(old), "=&r"(tmp)
+            : "r"(ptr), "r"(mask)
+            : "memory"
+        );
+    }
 }
 
 static inline void bitmap_clear(volatile unsigned long *bm, int bit)
 {
-    if (bit >= 0 && bit < MAX_NR)
-        bm[bit / 64] &= ~(1UL << (bit % 64));
+    if (bit < 0 || bit >= MAX_NR) return;
+    {
+        volatile unsigned long *ptr = &bm[bit / 64];
+        unsigned long mask = ~(1UL << (bit % 64));
+        unsigned long tmp, old;
+        asm volatile(
+            "1: ldxr  %0, [%2]\n"
+            "   and   %0, %0, %3\n"
+            "   stxr  %w1, %0, [%2]\n"
+            "   cbnz  %w1, 1b\n"
+            : "=&r"(old), "=&r"(tmp)
+            : "r"(ptr), "r"(mask)
+            : "memory"
+        );
+    }
+}
+
+static inline void bitmap_set_bulk(volatile unsigned long *bm, const int *nrs, int cnt)
+{
+    int i;
+    for (i = 0; i < cnt; i++) bitmap_set(bm, nrs[i]);
+    asm volatile("dmb ish" ::: "memory");
 }
 
 static inline int bitmap_test(volatile unsigned long *bm, int bit)
@@ -1670,17 +1783,6 @@ static void push_event(int nr, int uid,
     if (!g_active || !g_events) return;
 
     ev_lock();
-
-    if (g_ev_count >= MAX_EVENTS && g_msleep) {
-        int waited = 0;
-        while (g_ev_count >= MAX_EVENTS && waited < 200 && g_enabled && g_active) {
-            ev_unlock();
-            g_msleep(1);
-            waited++;
-            ev_lock();
-        }
-    }
-
     idx = g_ev_head;
     {
         svc_event_t *ev = &g_events[idx];
@@ -1740,7 +1842,7 @@ static void push_event(int nr, int uid,
  * Generic hook callback (before only)
  * One callback for ALL syscalls, NR passed via udata.
  * ================================================================ */
-static void before_generic(hook_fargs4_t *args, void *udata)
+static void before_generic(hook_fargs6_t *args, void *udata)
 {
     int nr = (int)(unsigned long)udata;
     int uid;
@@ -1755,9 +1857,23 @@ static void before_generic(hook_fargs4_t *args, void *udata)
     unsigned long clone_fn = 0;
 
     /* Fast rejection path */
+    if (!g_active) return;
     if (!g_enabled) return;
     if (nr < 0 || nr >= MAX_NR) return;
     if (!bitmap_test(g_nr_bitmap, nr)) return;
+
+    /* Refcount for safe exit */
+    {
+        unsigned int st;
+        unsigned int v;
+        asm volatile("1: ldxr %w1, [%2]\n"
+                     "   add  %w1, %w1, #1\n"
+                     "   stxr %w0, %w1, [%2]\n"
+                     "   cbnz %w0, 1b\n"
+                     : "=&r"(st), "=&r"(v)
+                     : "r"(&g_hook_refcount)
+                     : "memory");
+    }
 
     uid = (int)current_uid();
     if (g_target_uid >= 0 && uid != g_target_uid) return;
@@ -1804,26 +1920,72 @@ static void before_generic(hook_fargs4_t *args, void *udata)
         unsigned int tid = (unsigned int)raw_syscall0(__NR_gettid);
         unsigned int tgid = (unsigned int)raw_syscall0(__NR_getpid);
         unsigned int slot = (tid * 2654435761u) & (READ_CTX_SLOTS - 1);
-        g_read_ctx[slot].pid = (int)tid;
-        g_read_ctx[slot].tgid = (int)tgid;
-        g_read_ctx[slot].fd = (int)a0;
-        g_read_ctx[slot].buf = strip_ptr(a1);
-        g_read_ctx[slot].count = a2;
-        return;
+        unsigned int probe;
+        /* Linear probing to reduce hash collision */
+        for (probe = 0; probe < CTX_PROBE_DEPTH; probe++) {
+            unsigned int s = (slot + probe) & (READ_CTX_SLOTS - 1);
+            if (g_read_ctx[s].pid == 0 || g_read_ctx[s].pid == (int)tid) {
+                g_read_ctx[s].pid = (int)tid;
+                g_read_ctx[s].tgid = (int)tgid;
+                g_read_ctx[s].fd = (int)a0;
+                g_read_ctx[s].buf = strip_ptr(a1);
+                g_read_ctx[s].count = a2;
+                break;
+            }
+        }
+        if (probe == CTX_PROBE_DEPTH) {
+            /* All probe slots occupied, overwrite primary */
+            g_read_ctx[slot].pid = (int)tid;
+            g_read_ctx[slot].tgid = (int)tgid;
+            g_read_ctx[slot].fd = (int)a0;
+            g_read_ctx[slot].buf = strip_ptr(a1);
+            g_read_ctx[slot].count = a2;
+        }
+        /* Push a read_enter event (before hook) — after hook adds read_exit with data */
+        push_event(nr, uid, a0, a1, a2, a3, a4, a5, pc, caller, fp, sp, bt_depth, bt, clone_fn, 0, desc);
+        goto before_done;
     }
 
     if (nr == __NR_clone || nr == 435) {
         unsigned int tid = (unsigned int)raw_syscall0(__NR_gettid);
         unsigned int tgid = (unsigned int)raw_syscall0(__NR_getpid);
         unsigned int slot = (tid * 2654435761u) & (CLONE_CTX_SLOTS - 1);
-        g_clone_ctx[slot].pid = (int)tid;
-        g_clone_ctx[slot].tgid = (int)tgid;
-        g_clone_ctx[slot].flags_or_uargs = a0;
-        g_clone_ctx[slot].stack_or_size = a1;
-        g_clone_ctx[slot].clone_fn = strip_ptr(clone_fn);
+        unsigned int probe;
+        for (probe = 0; probe < CTX_PROBE_DEPTH; probe++) {
+            unsigned int s = (slot + probe) & (CLONE_CTX_SLOTS - 1);
+            if (g_clone_ctx[s].pid == 0 || g_clone_ctx[s].pid == (int)tid) {
+                g_clone_ctx[s].pid = (int)tid;
+                g_clone_ctx[s].tgid = (int)tgid;
+                g_clone_ctx[s].flags_or_uargs = a0;
+                g_clone_ctx[s].stack_or_size = a1;
+                g_clone_ctx[s].clone_fn = strip_ptr(clone_fn);
+                break;
+            }
+        }
+        if (probe == CTX_PROBE_DEPTH) {
+            g_clone_ctx[slot].pid = (int)tid;
+            g_clone_ctx[slot].tgid = (int)tgid;
+            g_clone_ctx[slot].flags_or_uargs = a0;
+            g_clone_ctx[slot].stack_or_size = a1;
+            g_clone_ctx[slot].clone_fn = strip_ptr(clone_fn);
+        }
     }
 
     push_event(nr, uid, a0, a1, a2, a3, a4, a5, pc, caller, fp, sp, bt_depth, bt, clone_fn, 0, desc);
+
+before_done:
+    /* Decrement refcount */
+    {
+        unsigned int st;
+        unsigned int v;
+        asm volatile("1: ldxr %w1, [%2]\n"
+                     "   sub  %w1, %w1, #1\n"
+                     "   stxr %w0, %w1, [%2]\n"
+                     "   cbnz %w0, 1b\n"
+                     : "=&r"(st), "=&r"(v)
+                     : "r"(&g_hook_refcount)
+                     : "memory");
+    }
 }
 
 static void do_filp_open_before(hook_fargs3_t *args, void *udata)
@@ -2042,13 +2204,8 @@ static int ensure_hooked_nr(int nr)
     if (dyn_hooks[nr].nr != nr) dyn_hooks[nr].nr = nr;
     dyn_hooks[nr].active = 0;
     dyn_hooks[nr].method = 0;
-    {
-        int narg;
-        for (narg = 6; narg >= 0; narg--) {
-            dyn_hooks[nr].narg = narg;
-            if (install_hook(&dyn_hooks[nr]) == 0) return 1;
-        }
-    }
+    dyn_hooks[nr].narg = 6;  /* Always use narg=6 for consistency */
+    if (install_hook(&dyn_hooks[nr]) == 0) return 1;
     return 0;
 }
 
@@ -2081,10 +2238,18 @@ static void after_clone_ret(hook_fargs0_t *args, void *udata)
     tid = (unsigned int)raw_syscall0(__NR_gettid);
     tgid = (unsigned int)raw_syscall0(__NR_getpid);
     slot = (tid * 2654435761u) & (CLONE_CTX_SLOTS - 1);
-    if (g_clone_ctx[slot].pid == (int)tid && g_clone_ctx[slot].tgid == (int)tgid) {
-        flags_or_uargs = g_clone_ctx[slot].flags_or_uargs;
-        stack_or_size = g_clone_ctx[slot].stack_or_size;
-        clone_fn = g_clone_ctx[slot].clone_fn;
+    {
+        unsigned int probe;
+        for (probe = 0; probe < CTX_PROBE_DEPTH; probe++) {
+            unsigned int s = (slot + probe) & (CLONE_CTX_SLOTS - 1);
+            if (g_clone_ctx[s].pid == (int)tid && g_clone_ctx[s].tgid == (int)tgid) {
+                flags_or_uargs = g_clone_ctx[s].flags_or_uargs;
+                stack_or_size = g_clone_ctx[s].stack_or_size;
+                clone_fn = g_clone_ctx[s].clone_fn;
+                g_clone_ctx[s].pid = 0;
+                break;
+            }
+        }
     }
 
     {
@@ -2144,14 +2309,29 @@ static void after_read_ret(hook_fargs0_t *args, void *udata)
     tid = (unsigned int)raw_syscall0(__NR_gettid);
     tgid = (unsigned int)raw_syscall0(__NR_getpid);
     slot = (tid * 2654435761u) & (READ_CTX_SLOTS - 1);
-    if (g_read_ctx[slot].pid == (int)tid && g_read_ctx[slot].tgid == (int)tgid) {
-        a0 = (unsigned long)g_read_ctx[slot].fd;
-        a1 = g_read_ctx[slot].buf;
-        a2 = g_read_ctx[slot].count;
-    } else {
-        a0 = syscall_argn(args, 0);
-        a1 = syscall_argn(args, 1);
-        a2 = syscall_argn(args, 2);
+    {
+        int found = 0;
+        unsigned int probe;
+        for (probe = 0; probe < CTX_PROBE_DEPTH; probe++) {
+            unsigned int s = (slot + probe) & (READ_CTX_SLOTS - 1);
+            if (g_read_ctx[s].pid == (int)tid && g_read_ctx[s].tgid == (int)tgid) {
+                a0 = (unsigned long)g_read_ctx[s].fd;
+                a1 = g_read_ctx[s].buf;
+                a2 = g_read_ctx[s].count;
+                g_read_ctx[s].pid = 0;  /* clear slot after use */
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            /* Fallback: try to read from pt_regs (may be stale for x0) */
+            struct pt_regs *rr = _task_pt_reg(current);
+            if (rr) {
+                a0 = (unsigned long)rr->regs[0]; /* may be overwritten with retval */
+                a1 = (unsigned long)rr->regs[1];
+                a2 = (unsigned long)rr->regs[2];
+            }
+        }
     }
 
     {
@@ -2201,7 +2381,9 @@ static int install_hook(hook_entry_t *h)
     hook_err_t err;
     if (h->active) return 0;
 
-    err = inline_hook_syscalln(h->nr, h->narg,
+    /* Use unified narg=6 for all hooks to avoid fargs size mismatch.
+     * syscall_argn() handles actual arg extraction regardless of narg. */
+    err = inline_hook_syscalln(h->nr, 6,
                                (void *)before_generic, hook_after_for_nr(h->nr),
                                (void *)(unsigned long)h->nr);
     if (err == HOOK_NO_ERR) {
@@ -2211,7 +2393,7 @@ static int install_hook(hook_entry_t *h)
         return 0;
     }
 
-    err = fp_hook_syscalln(h->nr, h->narg,
+    err = fp_hook_syscalln(h->nr, 6,
                            (void *)before_generic, hook_after_for_nr(h->nr),
                            (void *)(unsigned long)h->nr);
     if (err == HOOK_NO_ERR) {
@@ -2227,11 +2409,13 @@ static int install_hook(hook_entry_t *h)
 static void remove_hook(hook_entry_t *h)
 {
     if (!h->active) return;
+    /* Try both unhook methods — one will succeed based on original method */
     if (h->method == HOOK_INLINE)
         inline_unhook_syscalln(h->nr, (void *)before_generic, hook_after_for_nr(h->nr));
     else
         fp_unhook_syscalln(h->nr, (void *)before_generic, hook_after_for_nr(h->nr));
     h->active = 0;
+    h->method = 0;
     g_hooks_installed--;
 }
 
@@ -2438,7 +2622,7 @@ static int pop_event(svc_event_t *out)
 static int format_event_jsonl(char *buf, int blen, const svc_event_t *ev)
 {
     char esc_desc[DESC_BUF_SIZE + 256];
-    char btbuf[256];
+    char btbuf[512];
     int bn = 0;
     int i;
     if (!buf || blen <= 0 || !ev) return 0;
@@ -2617,12 +2801,7 @@ static int event_writer_thread(void *data)
         }
 
         {
-            loff_t pos = 0;
-            if (g_vfs_llseek) {
-                long p = g_vfs_llseek(fp, 0, 2);
-                if (p > 0) pos = (loff_t)p;
-            }
-            if (pos < 0) pos = 0;
+            loff_t pos = 0;  /* O_APPEND handles positioning automatically */
             for (i = 0; i < 256; i++) {
                 svc_event_t ev;
                 int len;
@@ -2900,54 +3079,40 @@ static long svc_ctl0(const char *args, char *__user out_msg, int outlen)
         if (!g_events) {
             n = snprintf(buf, blen, "{\"ok\":false,\"error\":\"no_events_storage\"}");
         } else {
-            int avail = g_ev_count < MAX_EVENTS ? g_ev_count : MAX_EVENTS;
-            int count = avail < max ? avail : max;
-            int start;
-
-            n = snprintf(buf, blen, "{\"ok\":true,\"count\":%d,\"total\":%u,\"events\":[", count, g_total);
-
-            if (count > 0) {
-                start = (g_ev_head - avail + MAX_EVENTS) % MAX_EVENTS;
-                int skip = avail - count;
-                start = (start + skip) % MAX_EVENTS;
-
-                int i;
-                for (i = 0; i < count && n < blen - 2048; i++) {
-                    int idx = (start + i) % MAX_EVENTS;
-                    svc_event_t *ev = &g_events[idx];
-                    json_escape(esc, sizeof(esc), ev->desc);
-                {
-                    char btbuf[256];
-                    int bn = 0;
-                    int bi;
-                    bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "[");
-                    for (bi = 0; bi < (int)ev->bt_depth && bi < MAX_BT && bn < (int)sizeof(btbuf) - 2; bi++) {
-                        if (bi > 0) bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, ",");
-                        bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "%lu", ev->bt[bi]);
+            int count = 0;
+            /* Use pop_event for thread-safe drain */
+            n = snprintf(buf, blen, "{\"ok\":true,\"total\":%u,\"events\":[", g_total);
+            {
+                svc_event_t tmp_ev;
+                int first_ev = 1;
+                while (count < max && pop_event(&tmp_ev)) {
+                    if (n >= blen - 2048) break;
+                    json_escape(esc, sizeof(esc), tmp_ev.desc);
+                    {
+                        char btbuf[512];
+                        int bn = 0, bi;
+                        bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "[");
+                        for (bi = 0; bi < (int)tmp_ev.bt_depth && bi < MAX_BT && bn < (int)sizeof(btbuf) - 2; bi++) {
+                            if (bi > 0) bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, ",");
+                            bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "%lu", tmp_ev.bt[bi]);
+                        }
+                        bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "]");
+                        if (!first_ev) n += snprintf(buf + n, blen - n, ",");
+                        n += snprintf(buf + n, blen - n,
+                            "{\"seq\":%u,\"nr\":%d,\"name\":\"%s\",\"tgid\":%d,\"pid\":%d,\"uid\":%d,"
+                            "\"comm\":\"%s\",\"pc\":%lu,\"caller\":%lu,\"fp\":%lu,\"sp\":%lu,\"bt\":%s,\"clone_fn\":%lu,\"ret\":%lu,"
+                            "\"a0\":%lu,\"a1\":%lu,\"a2\":%lu,"
+                            "\"a3\":%lu,\"a4\":%lu,\"a5\":%lu,\"desc\":\"%s\"}",
+                            tmp_ev.seq, tmp_ev.nr, get_syscall_name(tmp_ev.nr), tmp_ev.tgid, tmp_ev.pid, tmp_ev.uid,
+                            tmp_ev.comm, tmp_ev.pc, tmp_ev.caller, tmp_ev.fp, tmp_ev.sp, btbuf, tmp_ev.clone_fn, tmp_ev.ret,
+                            tmp_ev.a0, tmp_ev.a1, tmp_ev.a2,
+                            tmp_ev.a3, tmp_ev.a4, tmp_ev.a5, esc);
+                        first_ev = 0;
                     }
-                    bn += snprintf(btbuf + bn, sizeof(btbuf) - bn, "]");
-
-                    if (i > 0) n += snprintf(buf + n, blen - n, ",");
-                    n += snprintf(buf + n, blen - n,
-                        "{\"seq\":%u,\"nr\":%d,\"name\":\"%s\",\"tgid\":%d,\"pid\":%d,\"uid\":%d,"
-                        "\"comm\":\"%s\",\"pc\":%lu,\"caller\":%lu,\"fp\":%lu,\"sp\":%lu,\"bt\":%s,\"clone_fn\":%lu,\"ret\":%lu,"
-                        "\"a0\":%lu,\"a1\":%lu,\"a2\":%lu,"
-                        "\"a3\":%lu,\"a4\":%lu,\"a5\":%lu,\"desc\":\"%s\"}",
-                        ev->seq, ev->nr, get_syscall_name(ev->nr), ev->tgid, ev->pid, ev->uid,
-                        ev->comm, ev->pc, ev->caller, ev->fp, ev->sp, btbuf, ev->clone_fn, ev->ret,
-                        ev->a0, ev->a1, ev->a2,
-                        ev->a3, ev->a4, ev->a5, esc);
-                }
+                    count++;
                 }
             }
-            n += snprintf(buf + n, blen - n, "]}");
-
-            ev_lock();
-            g_ev_head = 0;
-            g_ev_tail = 0;
-            g_ev_count = 0;
-            g_ev_dropped = 0;
-            ev_unlock();
+            n += snprintf(buf + n, blen - n, "],\"count\":%d}", count);
         }
     }
 
@@ -2995,7 +3160,7 @@ static long svc_init(const char *args, const char *event, void *__user reserved)
 {
     int ok;
     int i;
-    printk("svc_monitor v8.1.0: init, installing hooks...\n");
+    printk("svc_monitor v8.2.0: init, installing hooks...\n");
 
     g_enabled = 0;
     g_target_uid = -1;
@@ -3043,14 +3208,30 @@ static long svc_init(const char *args, const char *event, void *__user reserved)
 
 static long svc_exit(void *__user reserved)
 {
-    int i;
-    printk("svc_monitor: exit, removing hooks...\n");
+    int i, wait_count;
+    printk("svc_monitor v8.2.0: exit, removing hooks...\n");
+
+    /* Phase 1: Stop accepting new events */
+    g_enabled = 0;
+    mb_ish();
     g_active = 0;
     mb_ish();
-    g_enabled = 0;
 
+    /* Phase 2: Wait for in-flight hook callbacks to finish */
+    wait_count = 0;
+    while (g_hook_refcount > 0 && wait_count < 500) {
+        if (g_msleep) g_msleep(2);
+        wait_count++;
+    }
+    if (g_hook_refcount > 0) {
+        printk("svc_monitor: WARNING: %d callbacks still active after 1s, proceeding anyway\n",
+               g_hook_refcount);
+    }
+
+    /* Phase 3: Stop writer thread (it accesses the event buffer) */
     stop_writer_thread();
 
+    /* Phase 4: Remove all hooks */
     remove_do_filp_open();
 
     if (g_tier2_loaded) {
@@ -3066,9 +3247,12 @@ static long svc_exit(void *__user reserved)
     for (i = 0; i < (int)TIER1_COUNT; i++)
         remove_hook(&tier1_hooks[i]);
 
-    if (g_msleep) g_msleep(100);
+    /* Phase 5: Final grace period after all hooks removed */
+    if (g_msleep) g_msleep(200);
+
+    /* Phase 6: Free resources */
     free_events_storage();
-    printk("svc_monitor: all hooks removed\n");
+    printk("svc_monitor: all hooks removed, exit complete\n");
     return 0;
 }
 

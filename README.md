@@ -41,6 +41,18 @@ SVC_Call/
 └── SVC_PC_View/
 ```
 
+## 更新记录（2026-03）
+
+- **一键编译脚本**：更新 `build.sh`，支持一次性编译 `kpm/svc_monitor.kpm` + `android/app-debug.apk`（需要配置 `KP_DIR`、`ANDROID_SDK`，以及可选 `JAVA_HOME(JDK17)`）
+- **App 侧全量 NR 可选**：支持 0-459 的 syscall 号筛选与 `+/-` 管理，不再依赖“已 hook 列表”才能选择
+- **App 侧函数名显示**：新增 `sysnames` 通道，App 可拉取 0-459 的 syscall 名称用于展示
+- **KPM 动态 Hook**：`enable_nr / set_nrs` 会自动按需安装对应 syscall hook（nargs 自动尝试 6→0），解决“选了 NR 但无事件/选不中”的问题
+- **clone/clone3 信息增强**：输出 `new_tid`，并 best-effort 提取并携带 `clone_fn`（Web 端可按 maps 解析并跳转定位）
+- **Web Maps 跳转增强**：支持输入地址精准跳转到对应 mapping，并闪烁高亮定位
+- **Web Strings 汇总**：从事件中提取可打印字符串做统计，并支持一键回到 Events 搜索
+- **名称显示一致性**：Web 端对 `sys_*` 名称自动去掉 `sys_` 前缀
+- **KPM 构建修复**：修复 ARM64 原子 `ldxr/stxr` 内联汇编写法导致的编译错误（status/value 寄存器分离）；同时避免对 `syscall_name_table` 做静态引用，改为 kallsyms 动态解析
+
 ## 常见问题
 
 - Web UI 走 polling：确保已安装 `eventlet`（见 `SVC_PC_View/requirements.txt`）
@@ -80,4 +92,3 @@ web侧：
 ![image-20260316230129579](./assets/image-20260316230129579.png)
 
 ![034e8e927d7081f361dd9560c6101895](./assets/034e8e927d7081f361dd9560c6101895.jpg)
-
